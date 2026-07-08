@@ -30,7 +30,7 @@ checkpoint:
   # From Check Point Portal → Global Settings → API Keys →
   # service "Centralized IOC Management"
   auth_url: "https://cloudinfra-gw.portal.checkpoint.com"
-  api_base_url: "https://cloudinfra-gw.portal.checkpoint.com/app/ioc-mgmt/api"
+  api_base_url: "https://cloudinfra-gw.portal.checkpoint.com/app/ioc-management"
   client_id: "your-checkpoint-client-id"
   access_key: "your-checkpoint-access-key"
 
