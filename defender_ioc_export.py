@@ -7,10 +7,10 @@ injects valid public IPv4 indicators into a Check Point
 IOC Management feed, and optionally removes stale IOCs.
 
 Usage:
-    python defender_ioc_export.py                 # normal run (no cleanup)
-    python defender_ioc_export.py --test          # dry-run, no changes
-    python defender_ioc_export.py --cleanup       # inject + cleanup stale
-    python defender_ioc_export.py --no-cleanup    # force cleanup off
+    python defender_ioc_export.py                    # export + inject (no cleanup)
+    python defender_ioc_export.py --test             # dry run, no changes
+    python defender_ioc_export.py --cleanup          # inject + cleanup stale
+    python defender_ioc_export.py --no-cleanup       # force cleanup off
     python defender_ioc_export.py --skip-checkpoint  # export files only
 """
 
@@ -419,6 +419,21 @@ class CheckPointIOCClient:
     Client for the Check Point Custom IOC Management API.
     Auth: POST {auth_url}/auth/external with {clientId, accessKey}
     JWT valid ~30 minutes.
+
+    Feeds schema (per GetFeedsResponse):
+      { "feeds": [
+          { "feed_id": <uuid>,
+            "feed_name": <str>,
+            "feed_type": "MANUAL|LIVE|XDR|DEFAULT",
+            "enabled": <bool>,
+            "total_indicators": <int>,
+            "enabled_indicators": <int>,
+            "default_confidence": <int>,
+            "default_severity": <int>,
+            "default_ttl_in_days": <int>,
+            "description": <str>,
+            "last_update": "YYYY-MM-DD"
+          } ] }
     """
 
     def __init__(self, session, cfg):
@@ -457,7 +472,7 @@ class CheckPointIOCClient:
             raise RuntimeError("Check Point auth response missing token")
 
         self.token = token
-        self.expires_at = time.time() + (25 * 60)   # refresh before 30-min expiry
+        self.expires_at = time.time() + (25 * 60)  # refresh before 30-min expiry
         log.info("Check Point authentication successful")
 
     def _ensure_token(self):
@@ -474,8 +489,11 @@ class CheckPointIOCClient:
     # ---------- feed discovery ----------
 
     def list_feeds(self):
+        """GET /feeds  → returns list of VerboseFeedResponse dicts."""
         self._ensure_token()
         url = f"{self.cp_cfg['api_base_url'].rstrip('/')}/feeds"
+
+        log.info("GET %s", url)
 
         response = None
         try:
@@ -486,22 +504,65 @@ class CheckPointIOCClient:
             log_http_error("Check Point list feeds", response, self.debug_http)
             raise
 
-        data = response.json()
-        if isinstance(data, dict):
-            return data.get("data", data.get("feeds", []))
-        return data
+        try:
+            data = response.json()
+        except ValueError:
+            log.error("GET /feeds did not return JSON. Body: %s",
+                      response.text[:2000])
+            raise
+
+        feeds = data.get("feeds", []) if isinstance(data, dict) else []
+        log.debug("GET /feeds returned %d feeds", len(feeds))
+        return feeds
 
     def find_feed_id(self, feed_name):
+        """Return feed_id UUID for feed_name (case-insensitive, trimmed)."""
         feeds = self.list_feeds()
+
+        if not feeds:
+            log.error("Check Point returned zero feeds")
+            return None
+
+        log.info("Retrieved %d feeds from Check Point:", len(feeds))
         for f in feeds:
-            name = f.get("name") or f.get("feedName")
-            if name and name.lower() == feed_name.lower():
-                return f.get("id") or f.get("feedId") or f.get("_id")
+            log.info(
+                "  - name=%r  id=%s  type=%s  enabled=%s  indicators=%s",
+                f.get("feed_name"),
+                f.get("feed_id"),
+                f.get("feed_type"),
+                f.get("enabled"),
+                f.get("total_indicators"),
+            )
+
+        target = (feed_name or "").strip().lower()
+        for f in feeds:
+            name = (f.get("feed_name") or "").strip().lower()
+            if name == target:
+                fid = f.get("feed_id")
+                if not f.get("enabled"):
+                    log.warning("Feed %r is DISABLED — indicators may be "
+                                "ingested but not enforced", feed_name)
+                if f.get("feed_type") != "MANUAL":
+                    log.warning("Feed %r has feed_type=%s (expected MANUAL). "
+                                "The API may reject writes.",
+                                feed_name, f.get("feed_type"))
+                log.info("Matched feed %r -> feed_id=%s", feed_name, fid)
+                return fid
+
+        log.error(
+            "Feed %r not found. Available feeds: %s",
+            feed_name,
+            [f.get("feed_name") for f in feeds]
+        )
         return None
 
     # ---------- indicator listing ----------
 
     def list_indicators(self, feed_id, page_size=500):
+        """
+        GET /feeds/{feed_id}/indicators — paginated.
+        Handles list or {"indicators": [...]} response shapes.
+        """
         self._ensure_token()
         base_url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                     f"/feeds/{feed_id}/indicators")
@@ -531,11 +592,16 @@ class CheckPointIOCClient:
                 items = data
                 has_more = False
             else:
-                items = data.get("data") or data.get("indicators") \
-                    or data.get("items") or []
-                total = data.get("total") or data.get("totalCount") or 0
-                has_more = (len(all_items) + len(items)) < total \
-                    if total else len(items) == page_size
+                items = (data.get("indicators")
+                         or data.get("items")
+                         or data.get("data")
+                         or [])
+                total = (data.get("total")
+                         or data.get("total_count")
+                         or data.get("totalCount")
+                         or 0)
+                has_more = ((len(all_items) + len(items)) < total
+                            if total else len(items) == page_size)
 
             all_items.extend(items)
             log.debug("Feed %s page %d returned %d indicators",
@@ -546,6 +612,8 @@ class CheckPointIOCClient:
             page += 1
             time.sleep(0.3)
 
+        log.info("Total indicators loaded from feed %s: %d",
+                 feed_id, len(all_items))
         return all_items
 
     # ---------- indicator upload ----------
@@ -601,34 +669,64 @@ class CheckPointIOCClient:
 # INDICATOR TRANSFORMATION (Defender -> Check Point)
 # ============================================================
 
+# Defender severity strings -> Check Point integer scale
 SEVERITY_MAP = {
-    "Informational": "Low",
-    "Low":           "Low",
-    "Medium":        "Medium",
-    "High":          "High",
-    "Critical":      "Critical",
+    "Informational": 1,
+    "Low":           1,
+    "Medium":        2,
+    "High":          3,
+    "Critical":      4,
+}
+
+# Config string values -> integer
+CONFIDENCE_MAP = {
+    "Low":    1,
+    "Medium": 2,
+    "High":   3,
+}
+
+SEVERITY_STR_TO_INT = {
+    "Low":      1,
+    "Medium":   2,
+    "High":     3,
+    "Critical": 4,
 }
 
 
-def defender_to_cp_indicator(d, cp_cfg):
-    severity = SEVERITY_MAP.get(d.get("severity"), cp_cfg["default_severity"])
+def _to_int(value, mapping, default):
+    """Accept either an already-int value or map a string via the mapping."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value in mapping:
+        return mapping[value]
+    return default
 
-    expiration = d.get("expirationTime")
-    if not expiration:
-        exp_dt = datetime.now(timezone.utc) + timedelta(
-            days=cp_cfg["expiration_days"])
-        expiration = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def defender_to_cp_indicator(d, cp_cfg):
+    """
+    Convert a Defender indicator into a Check Point IOC payload.
+    Uses snake_case + integer severity/confidence to match the
+    Check Point Custom IOC Management API schema.
+    """
+    severity_int = SEVERITY_MAP.get(
+        d.get("severity"),
+        _to_int(cp_cfg.get("default_severity"), SEVERITY_STR_TO_INT, 3)
+    )
+    confidence_int = _to_int(
+        cp_cfg.get("default_confidence"), CONFIDENCE_MAP, 3
+    )
+    ttl_days = int(cp_cfg.get("expiration_days", 30))
 
     return {
         "value":       d["indicatorValue"],
         "type":        "ip",
-        "action":      cp_cfg["default_action"],
-        "severity":    severity,
-        "confidence":  cp_cfg["default_confidence"],
+        "action":      cp_cfg.get("default_action", "Prevent"),
+        "severity":    severity_int,
+        "confidence":  confidence_int,
+        "ttl_in_days": ttl_days,
         "description": d.get("description") or d.get("title") or
                        "Imported from Microsoft Defender XDR",
         "source":      "Microsoft Defender XDR",
-        "expiration":  expiration,
     }
 
 
@@ -757,7 +855,8 @@ def cleanup_stale_from_checkpoint(cfg, ipv4_indicators, summary,
     for e in existing_indicators:
         value = e.get("value") or e.get("indicatorValue")
         source = e.get("source", "")
-        indicator_id = e.get("id") or e.get("_id") or e.get("indicatorId")
+        indicator_id = (e.get("id") or e.get("_id")
+                        or e.get("indicatorId") or e.get("indicator_id"))
 
         if not value:
             continue
