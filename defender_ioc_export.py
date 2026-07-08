@@ -936,7 +936,7 @@ class CheckPointIOCClient:
 
     # ---------- indicator listing ----------
 
-def list_indicators(self, feed_id, page_size=500):
+    def list_indicators(self, feed_id, page_size=500):
         """
         GET /feeds/{feed_id}/indicators (paginated).
 
