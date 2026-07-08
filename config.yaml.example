@@ -28,21 +28,24 @@ checkpoint:
   enabled: true
 
   # From Check Point Portal → Global Settings → API Keys →
-  # service "Centralized IOC Management" -- Customized for the Canada Portal
-  auth_url: "https://cloudinfra-gw.ca.portal.checkpoint.com"
-  api_base_url: "https://cloudinfra-gw.ca.portal.checkpoint.com/app/ioc-management"
+  # service "Centralized IOC Management"
+  auth_url: "https://cloudinfra-gw.portal.checkpoint.com"
+  api_base_url: "https://cloudinfra-gw.portal.checkpoint.com/app/ioc-mgmt/api"
   client_id: "your-checkpoint-client-id"
   access_key: "your-checkpoint-access-key"
 
-  # Manual feed created in the IOC Management portal
+  # Manual feed pre-created in the IOC Management portal
+  # (Inputs → Custom Manual Feeds → Add feed)
   feed_name: "MSDefender_Autofeed"
 
-  # Batching / defaults
+  # Batching / defaults for created indicators.
+  # These accept either a string (Low/Medium/High/Critical) or an integer
+  # matching the Check Point API convention (1..4).
   batch_size: 100
-  default_severity: "High"        # Low | Medium | High | Critical
-  default_confidence: "High"      # Low | Medium | High
+  default_severity: "High"        # "Low"|"Medium"|"High"|"Critical"  or 1..4
+  default_confidence: "High"      # "Low"|"Medium"|"High"             or 1..3
   default_action: "Prevent"       # Prevent | Detect
-  expiration_days: 30
+  expiration_days: 30             # maps to ttl_in_days
 
   # Cleanup: remove IOCs from CP that are no longer in Defender
   cleanup:
