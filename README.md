@@ -4,6 +4,7 @@
 1. Edit config.yaml with correct values
 2. Execute ./configure.sh
 3. Execute the script:
+
 | Command                                                   | What it does                                                 |
 | --------------------------------------------------------- | ------------------------------------------------------------ |
 | `python defender_ioc_export.py`                           | Normal run: export files + inject new IPv4 IOCs (no cleanup) |
