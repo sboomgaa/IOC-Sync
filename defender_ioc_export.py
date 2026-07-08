@@ -936,16 +936,24 @@ class CheckPointIOCClient:
 
     # ---------- indicator listing ----------
 
-    def list_indicators(self, feed_id, page_size=500):
+def list_indicators(self, feed_id, page_size=500):
+        """
+        GET /feeds/{feed_id}/indicators (paginated).
+
+        The API uses `limit` (max items per page) and `offset` (skip count)
+        for pagination — NOT page/pageSize. Response envelope varies, so
+        we tolerate several common shapes.
+        """
         self._ensure_token()
         base_url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                     f"/feeds/{feed_id}/indicators")
 
         all_items = []
-        page = 1
+        offset = 0
+        limit = max(1, int(page_size))    # API rejects limit <= 0
 
         while True:
-            params = {"page": page, "pageSize": page_size}
+            params = {"limit": limit, "offset": offset}
             response_holder = {}
 
             def _do():
@@ -963,35 +971,40 @@ class CheckPointIOCClient:
             except requests.exceptions.HTTPError:
                 log_http_error(
                     f"Check Point list indicators "
-                    f"(feed {feed_id}, page {page})",
+                    f"(feed {feed_id}, offset {offset}, limit {limit})",
                     response_holder.get("r"), self.debug_http
                 )
                 raise
 
             data = response.json()
 
+            # Multiple response envelopes seen in Infinity Portal APIs
             if isinstance(data, list):
                 items = data
-                has_more = False
-            else:
+            elif isinstance(data, dict):
                 items = (data.get("indicators")
                          or data.get("items")
                          or data.get("data")
+                         or data.get("results")
                          or [])
-                total = (data.get("total")
-                         or data.get("total_count")
-                         or data.get("totalCount")
-                         or 0)
-                has_more = ((len(all_items) + len(items)) < total
-                            if total else len(items) == page_size)
+            else:
+                items = []
+
+            if not isinstance(items, list):
+                log.warning("Unexpected page structure at offset %d — "
+                            "stopping pagination", offset)
+                break
 
             all_items.extend(items)
-            log.debug("Feed %s page %d returned %d indicators",
-                      feed_id, page, len(items))
+            log.debug("Feed %s offset=%d returned %d indicators "
+                      "(cumulative %d)",
+                      feed_id, offset, len(items), len(all_items))
 
-            if not items or not has_more:
+            # Continue while we're getting full pages back
+            if len(items) < limit:
                 break
-            page += 1
+
+            offset += len(items)
             time.sleep(0.3)
 
         log.info("Total indicators loaded from feed %s: %d",
