@@ -5,12 +5,14 @@
 2. Execute ./configure.sh
 3. Execute the script:
 
-| Command                                                   | What it does                                                 |
-| --------------------------------------------------------- | ------------------------------------------------------------ |
-| `python defender_ioc_export.py`                           | Normal run: export files + inject new IPv4 IOCs (no cleanup) |
-| `python defender_ioc_export.py --test`                    | Dry run — no changes, writes preview files                   |
-| `python defender_ioc_export.py --cleanup`                 | Inject new + delete stale IOCs                               |
-| `python defender_ioc_export.py --test --cleanup`          | Dry run of full inject + cleanup                             |
-| `python defender_ioc_export.py --no-cleanup`              | Force cleanup off                                            |
-| `python defender_ioc_export.py --skip-checkpoint`         | Export files only                                            |
-| `python defender_ioc_export.py --config /path/other.yaml` | Use alternate config                                         |
+| Command                                            | Behavior                      |
+| -------------------------------------------------- | ----------------------------- |
+| `python defender_ioc_export.py`                    | Export + upsert new IPv4 IOCs |
+| `python defender_ioc_export.py --test`             | Dry run, writes preview files |
+| `python defender_ioc_export.py --cleanup`          | Upsert + delete stale IOCs    |
+| `python defender_ioc_export.py --test --cleanup`   | Dry run of full sync          |
+| `python defender_ioc_export.py --no-cleanup`       | Force cleanup off             |
+| `python defender_ioc_export.py --skip-checkpoint`  | Export only                   |
+| `python defender_ioc_export.py -i input.json`      | Load from JSON file           |
+| `python defender_ioc_export.py -i input.csv`       | Load from CSV file            |
+| `python defender_ioc_export.py -i test.csv --test` | Full offline dry run          |
