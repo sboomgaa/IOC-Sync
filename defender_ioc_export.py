@@ -2,27 +2,32 @@
 """
 Defender XDR → Check Point IOC Management
 ------------------------------------------
-Exports threat indicators from Microsoft Defender XDR,
-injects valid public IPv4 indicators into a Check Point
-IOC Management feed, and optionally removes stale IOCs.
+Exports threat indicators from Microsoft Defender XDR (or loads them from
+a local file), upserts valid public IPv4 indicators into a Check Point IOC
+Management feed via PUT (batched), and optionally deletes stale IOCs via
+DELETE (per-item, base64-encoded value).
 
 Usage:
-    python defender_ioc_export.py                    # export + inject (no cleanup)
+    python defender_ioc_export.py                    # normal run
     python defender_ioc_export.py --test             # dry run, no changes
     python defender_ioc_export.py --cleanup          # inject + cleanup stale
     python defender_ioc_export.py --no-cleanup       # force cleanup off
     python defender_ioc_export.py --skip-checkpoint  # export files only
+    python defender_ioc_export.py -i input.json      # load from JSON file
+    python defender_ioc_export.py -i input.csv       # load from CSV file
 """
 
 import argparse
+import base64
 import csv
 import ipaddress
 import json
 import logging
 import os
+import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -57,38 +62,44 @@ SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie",
 def log_http_error(context, response, debug_http=True,
                    sensitive_body_keys=("client_secret", "access_token",
                                         "refresh_token", "id_token",
-                                        "accessKey", "token")):
+                                        "accessKey", "token", "jwt",
+                                        "access_key")):
     log.error("=" * 60)
     log.error("HTTP ERROR CONTEXT: %s", context)
-    log.error("Status Code:        %s %s", response.status_code, response.reason)
-    log.error("Request URL:        %s", response.url)
-    log.error("Request Method:     %s", response.request.method)
+    if response is not None:
+        log.error("Status Code:        %s %s",
+                  response.status_code, response.reason)
+        log.error("Request URL:        %s", response.url)
+        log.error("Request Method:     %s", response.request.method)
 
-    for h in ("x-ms-request-id", "x-ms-correlation-request-id",
-              "request-id", "client-request-id",
-              "x-chkp-request-id", "x-request-id"):
-        if h in response.headers:
-            log.error("Header %-30s = %s", h, response.headers[h])
+        for h in ("x-ms-request-id", "x-ms-correlation-request-id",
+                  "request-id", "client-request-id",
+                  "x-chkp-request-id", "x-request-id"):
+            if h in response.headers:
+                log.error("Header %-30s = %s", h, response.headers[h])
 
-    if not debug_http:
-        log.error("Response body suppressed (set logging.debug_http: true)")
-        log.error("=" * 60)
-        return
+        if not debug_http:
+            log.error("Response body suppressed "
+                      "(set logging.debug_http: true)")
+            log.error("=" * 60)
+            return
 
-    try:
-        body_json = response.json()
-        if isinstance(body_json, dict):
-            for k in sensitive_body_keys:
-                if k in body_json:
-                    body_json[k] = "***REDACTED***"
-        log.error("Response Body (JSON):\n%s",
-                  json.dumps(body_json, indent=2, ensure_ascii=False))
-    except ValueError:
-        body_text = response.text or ""
-        truncated = body_text[:2000]
-        if len(body_text) > 2000:
-            truncated += f"\n... (truncated, {len(body_text)} bytes total)"
-        log.error("Response Body (raw):\n%s", truncated)
+        try:
+            body_json = response.json()
+            if isinstance(body_json, dict):
+                for k in sensitive_body_keys:
+                    if k in body_json:
+                        body_json[k] = "***REDACTED***"
+            log.error("Response Body (JSON):\n%s",
+                      json.dumps(body_json, indent=2, ensure_ascii=False))
+        except ValueError:
+            body_text = response.text or ""
+            truncated = body_text[:2000]
+            if len(body_text) > 2000:
+                truncated += f"\n... (truncated, {len(body_text)} bytes total)"
+            log.error("Response Body (raw):\n%s", truncated)
+    else:
+        log.error("No response object available")
 
     log.error("=" * 60)
 
@@ -124,6 +135,9 @@ class RunSummary:
         self.started_at = datetime.now(timezone.utc)
         self.finished_at = None
         self.test_mode = test_mode
+
+        self.source = "defender_api"
+        self.source_path = None
 
         self.defender_total = 0
         self.defender_by_type = {}
@@ -163,6 +177,8 @@ class RunSummary:
                                      if self.finished_at else None),
                 "duration_seconds": round(self.duration_seconds, 2),
                 "test_mode":        self.test_mode,
+                "source":           self.source,
+                "source_path":      self.source_path,
             },
             "defender": {
                 "total_indicators": self.defender_total,
@@ -198,7 +214,11 @@ class RunSummary:
         log.info("RUN SUMMARY REPORT" +
                  (" (TEST MODE)" if self.test_mode else ""))
         log.info("=" * 60)
-        log.info("Duration:                 %.2fs", d["run"]["duration_seconds"])
+        log.info("Duration:                 %.2fs",
+                 d["run"]["duration_seconds"])
+        log.info("Source:                   %s%s",
+                 self.source,
+                 f" ({self.source_path})" if self.source_path else "")
         log.info("")
         log.info("--- Defender XDR ---")
         log.info("Total indicators pulled:  %d", self.defender_total)
@@ -206,16 +226,16 @@ class RunSummary:
         log.info("By severity:              %s", self.defender_by_severity)
         log.info("")
         log.info("--- IPv4 Filter ---")
-        log.info("Valid public IPv4:        %d", self.ipv4_valid)
-        log.info("Skipped (not IpAddress):  %d", self.ipv4_skipped_type)
+        log.info("Valid public IPv4:         %d", self.ipv4_valid)
+        log.info("Skipped (not IpAddress):   %d", self.ipv4_skipped_type)
         log.info("Skipped (private/invalid): %d", self.ipv4_skipped_invalid)
         log.info("")
         log.info("--- Check Point Injection ---")
         log.info("Feed:                     %s (id=%s)",
                  self.cp_feed_name, self.cp_feed_id)
         log.info("Existing indicators:      %d", self.cp_existing_count)
-        log.info("Added:                    %d", self.cp_added)
-        log.info("Skipped (duplicate):      %d", self.cp_skipped_duplicate)
+        log.info("Upserted:                 %d", self.cp_added)
+        log.info("Skipped (unchanged):      %d", self.cp_skipped_duplicate)
         log.info("Failed:                   %d", self.cp_failed_add)
         log.info("")
         log.info("--- Check Point Cleanup ---")
@@ -247,7 +267,7 @@ def build_session():
     retries = Retry(
         total=5, backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST", "DELETE"],
+        allowed_methods=["GET", "POST", "PUT", "DELETE"],
         respect_retry_after_header=True
     )
     session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -270,7 +290,8 @@ class TokenManager:
         api = self.cfg["api"]
         debug_http = self.cfg.get("logging", {}).get("debug_http", True)
 
-        token_url = api["token_url_template"].format(tenant_id=azure["tenant_id"])
+        token_url = api["token_url_template"].format(
+            tenant_id=azure["tenant_id"])
         payload = {
             "client_id": azure["client_id"],
             "client_secret": azure["client_secret"],
@@ -280,11 +301,13 @@ class TokenManager:
 
         response = None
         try:
-            response = self.session.post(token_url, data=payload,
-                                          timeout=api["request_timeout_seconds"])
+            response = self.session.post(
+                token_url, data=payload,
+                timeout=api["request_timeout_seconds"])
             response.raise_for_status()
         except requests.exceptions.HTTPError:
-            log_http_error("Defender token acquisition", response, debug_http)
+            log_http_error("Defender token acquisition",
+                           response, debug_http)
             raise
 
         data = response.json()
@@ -300,7 +323,7 @@ class TokenManager:
 
 
 # ============================================================
-# DEFENDER INDICATORS RETRIEVAL
+# DEFENDER INDICATORS RETRIEVAL (API)
 # ============================================================
 
 def get_all_indicators(session, token_manager, cfg):
@@ -343,7 +366,8 @@ def get_all_indicators(session, token_manager, cfg):
         raw_pages.append(raw)
         page_values = raw.get("value", [])
         indicators.extend(page_values)
-        log.info("Page %d returned %d indicators", page_number, len(page_values))
+        log.info("Page %d returned %d indicators",
+                 page_number, len(page_values))
 
         url = raw.get("@odata.nextLink")
         page_number += 1
@@ -352,6 +376,276 @@ def get_all_indicators(session, token_manager, cfg):
             time.sleep(api["rate_limit_delay_seconds"])
 
     return indicators, raw_pages
+
+
+# ============================================================
+# LOAD INDICATORS FROM FILE (test / offline mode)
+# ============================================================
+
+# CSV column-name variants we accept for each canonical field.
+# All matching is case-insensitive, whitespace-tolerant.
+CSV_COLUMN_ALIASES = {
+    "indicatorValue": (
+        "indicatorvalue", "value", "ioc", "ioc_value", "indicator",
+        "ip", "ipaddress", "ip_address", "address", "host"
+    ),
+    "indicatorType": (
+        "indicatortype", "type", "ioc_type", "indicator_type"
+    ),
+    "severity": (
+        "severity", "sev", "level"
+    ),
+    "title": (
+        "title", "name", "label"
+    ),
+    "description": (
+        "description", "desc", "comment", "notes", "info"
+    ),
+    "expirationTime": (
+        "expirationtime", "expiration", "expiry", "expires", "ttl",
+        "expiration_time"
+    ),
+}
+
+
+def _normalize_csv_headers(fieldnames):
+    """Map raw CSV headers to canonical Defender field names."""
+    mapping = {}
+    for raw in fieldnames or []:
+        key = raw.strip().lower().replace(" ", "").replace("-", "_")
+        canonical = None
+        for canon, aliases in CSV_COLUMN_ALIASES.items():
+            if key == canon.lower() or key in aliases:
+                canonical = canon
+                break
+        mapping[raw] = canonical
+    return mapping
+
+
+def _sniff_csv_dialect(sample_text):
+    """Auto-detect CSV dialect (delimiter, quoting) from a sample."""
+    try:
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=",;\t|")
+        has_header = csv.Sniffer().has_header(sample_text)
+        return dialect, has_header
+    except csv.Error:
+        return csv.excel, True
+
+
+def _load_csv_indicators(path):
+    """Load indicators from a CSV or plain IP-list file."""
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+
+        if not sample.strip():
+            log.warning("CSV file is empty: %s", path)
+            return []
+
+        dialect, has_header = _sniff_csv_dialect(sample)
+        log.debug("CSV dialect: delimiter=%r, has_header=%s",
+                  getattr(dialect, "delimiter", ","), has_header)
+
+        # Header-less files → treat each row as a single indicator value
+        if not has_header:
+            log.info("CSV appears to have no header — treating each row "
+                     "as a single indicator value")
+            reader = csv.reader(f, dialect=dialect)
+            indicators = []
+            for row_num, row in enumerate(reader, start=1):
+                if not row:
+                    continue
+                value = row[0].strip()
+                if not value or value.startswith("#"):
+                    continue
+                indicators.append({
+                    "indicatorValue": value,
+                    "indicatorType": "IpAddress",
+                    "title": f"CSV row {row_num}",
+                })
+            return indicators
+
+        # Header-based parsing
+        reader = csv.DictReader(f, dialect=dialect)
+        header_map = _normalize_csv_headers(reader.fieldnames)
+
+        recognized = {k: v for k, v in header_map.items() if v}
+        unrecognized = [k for k, v in header_map.items() if not v]
+
+        log.info("CSV headers detected: recognized=%s%s",
+                 list(recognized.values()),
+                 f", ignored={unrecognized}" if unrecognized else "")
+
+        if "indicatorValue" not in recognized.values():
+            raise ValueError(
+                f"CSV has no recognizable value column. "
+                f"Headers found: {reader.fieldnames}. "
+                f"Rename one to one of: "
+                f"{CSV_COLUMN_ALIASES['indicatorValue']}"
+            )
+
+        indicators = []
+        for row_num, row in enumerate(reader, start=2):
+            item = {}
+            for raw_key, canonical in header_map.items():
+                if not canonical:
+                    continue
+                val = (row.get(raw_key) or "").strip()
+                if val:
+                    item[canonical] = val
+
+            if not item:
+                continue
+
+            if not item.get("indicatorValue"):
+                log.debug("CSV row %d has empty indicatorValue — skipping",
+                          row_num)
+                continue
+
+            if not item.get("indicatorType"):
+                item["indicatorType"] = "IpAddress"
+
+            if item.get("severity"):
+                item["severity"] = item["severity"].strip().capitalize()
+
+            indicators.append(item)
+
+        return indicators
+
+
+def load_indicators_from_file(path):
+    """
+    Load Defender-format indicators from a local file, bypassing the
+    Defender API.
+
+    Supported file types (auto-detected by extension, then content):
+      - .json → JSON (multiple structures accepted, see below)
+      - .csv  → CSV with header row (columns auto-mapped)
+      - Other → sniffed as JSON if starts with '{' or '[', else CSV
+
+    Accepted JSON structures:
+      A) Raw export from this script:
+         {"pageCount": N, "pages": [{"value": [{...}, ...]}, ...]}
+      B) Single-page envelope: {"value": [{...}, ...]}
+      C) Plain array: [{...}, {...}, ...]
+      D) Single indicator object
+
+    Returns: (indicators_list, raw_pages_list)
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    if not file_path.is_file():
+        raise ValueError(f"Input path is not a file: {path}")
+
+    log.info("Loading Defender indicators from file: %s", path)
+
+    # Decide by extension first
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".csv":
+        source_format = "csv"
+    elif suffix in (".json", ".jsonl"):
+        source_format = "json"
+    else:
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            head = f.read(2048).lstrip()
+        if head.startswith(("{", "[")):
+            source_format = "json"
+            log.debug("Unknown extension %r — content looks like JSON", suffix)
+        else:
+            source_format = "csv"
+            log.debug("Unknown extension %r — falling back to CSV", suffix)
+
+    # ---------- CSV path ----------
+    if source_format == "csv":
+        indicators = _load_csv_indicators(file_path)
+        raw_pages = [{
+            "value": indicators,
+            "_source": "file",
+            "_path": str(path),
+            "_format": "csv",
+        }]
+        log.info("Loaded %d indicators from CSV", len(indicators))
+
+    # ---------- JSON path ----------
+    else:
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Input file is not valid JSON: {path} ({e})"
+                ) from e
+
+        indicators = []
+        raw_pages = []
+
+        if isinstance(data, dict) and isinstance(data.get("pages"), list):
+            raw_pages = data["pages"]
+            for page in raw_pages:
+                if isinstance(page, dict):
+                    page_values = page.get("value", [])
+                    if isinstance(page_values, list):
+                        indicators.extend(page_values)
+            log.info("Detected raw export format (%d pages, %d indicators)",
+                     len(raw_pages), len(indicators))
+
+        elif isinstance(data, dict) and isinstance(data.get("value"), list):
+            raw_pages = [data]
+            indicators = data["value"]
+            log.info("Detected single-page envelope format (%d indicators)",
+                     len(indicators))
+
+        elif isinstance(data, list):
+            indicators = data
+            raw_pages = [{"value": indicators, "_source": "file",
+                          "_path": str(path)}]
+            log.info("Detected plain JSON array format (%d indicators)",
+                     len(indicators))
+
+        elif isinstance(data, dict) and "indicatorValue" in data:
+            indicators = [data]
+            raw_pages = [{"value": indicators, "_source": "file",
+                          "_path": str(path)}]
+            log.info("Detected single-indicator object")
+
+        else:
+            raise ValueError(
+                f"Unrecognized JSON structure in {path}. Expected one of:\n"
+                "  - {'pages': [...]} (raw export)\n"
+                "  - {'value': [...]} (single-page envelope)\n"
+                "  - [ {...}, {...} ] (indicator array)\n"
+                "  - {'indicatorValue': '...', ...} (single indicator)"
+            )
+
+    # ---------- Common validation ----------
+    valid_indicators = []
+    dropped = 0
+    for i, item in enumerate(indicators):
+        if not isinstance(item, dict):
+            log.warning("Item %d is not a dict (%s) — dropping",
+                        i, type(item).__name__)
+            dropped += 1
+            continue
+        if not item.get("indicatorValue"):
+            log.warning("Item %d missing 'indicatorValue' — dropping "
+                        "(keys: %s)", i, list(item.keys()))
+            dropped += 1
+            continue
+        if not item.get("indicatorType"):
+            log.warning("Item %d missing 'indicatorType' — assuming IpAddress",
+                        i)
+            item["indicatorType"] = "IpAddress"
+        valid_indicators.append(item)
+
+    if dropped:
+        log.warning("Dropped %d malformed items from input file", dropped)
+
+    log.info("Loaded %d valid indicators from %s",
+             len(valid_indicators), path)
+
+    return valid_indicators, raw_pages
 
 
 # ============================================================
@@ -417,24 +711,25 @@ def filter_ipv4_indicators(indicators, summary):
 class CheckPointIOCClient:
     """
     Client for the Check Point Custom IOC Management API.
-    Auth: POST {auth_url}/auth/external with {clientId, accessKey}
-    JWT valid ~30 minutes.
+    Auth: POST {auth_url}/auth/external → JWT valid ~30 minutes.
 
-    Feeds schema (per GetFeedsResponse):
-      { "feeds": [
-          { "feed_id": <uuid>,
-            "feed_name": <str>,
-            "feed_type": "MANUAL|LIVE|XDR|DEFAULT",
-            "enabled": <bool>,
-            "total_indicators": <int>,
-            "enabled_indicators": <int>,
-            "default_confidence": <int>,
-            "default_severity": <int>,
-            "default_ttl_in_days": <int>,
-            "description": <str>,
-            "last_update": "YYYY-MM-DD"
-          } ] }
+    Endpoints used:
+      GET    /feeds
+      GET    /feeds/{feed_id}/indicators
+      PUT    /feeds/{feed_id}/indicators                          (batch upsert)
+      DELETE /feeds/{feed_id}/indicators/{type}/{base64_value}    (single)
     """
+
+    _TOKEN_FIELD_PATHS = (
+        ("data", "token"),
+        ("token",),
+        ("accessToken",),
+        ("access_token",),
+        ("jwt",),
+        ("JWT_TOKEN",),
+        ("data", "accessToken"),
+        ("data", "jwt"),
+    )
 
     def __init__(self, session, cfg):
         self.session = session
@@ -446,62 +741,146 @@ class CheckPointIOCClient:
 
     # ---------- authentication ----------
 
+    @staticmethod
+    def _walk(d, path):
+        cur = d
+        for k in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+            if cur is None:
+                return None
+        return cur
+
+    @staticmethod
+    def _redact_dict(d):
+        if not isinstance(d, dict):
+            return
+        for k, v in list(d.items()):
+            if any(s in k.lower()
+                   for s in ("token", "secret", "key", "password", "jwt")):
+                d[k] = "***REDACTED***"
+            elif isinstance(v, dict):
+                CheckPointIOCClient._redact_dict(v)
+
     def _authenticate(self):
         auth_endpoint = f"{self.cp_cfg['auth_url'].rstrip('/')}/auth/external"
         payload = {
             "clientId": self.cp_cfg["client_id"],
             "accessKey": self.cp_cfg["access_key"]
         }
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
 
         log.info("Authenticating to Check Point IOC Management API")
+        log.debug("Auth endpoint: %s", auth_endpoint)
 
         response = None
         try:
-            response = self.session.post(auth_endpoint, json=payload,
-                                          headers=headers, timeout=self.timeout)
+            response = self.session.post(
+                auth_endpoint, json=payload,
+                headers=headers, timeout=self.timeout)
             response.raise_for_status()
         except requests.exceptions.HTTPError:
-            log_http_error("Check Point auth/external", response, self.debug_http)
+            log_http_error("Check Point auth/external",
+                           response, self.debug_http)
             raise
 
-        data = response.json()
-        token = data.get("token") or data.get("data", {}).get("token")
-        if not token:
-            log.error("Auth response did not contain 'token': %s", data)
-            raise RuntimeError("Check Point auth response missing token")
+        try:
+            data = response.json()
+        except ValueError:
+            log.error("Auth response was not JSON. Body: %s",
+                      response.text[:1000])
+            raise RuntimeError("Check Point auth response was not JSON")
 
-        self.token = token
-        self.expires_at = time.time() + (25 * 60)  # refresh before 30-min expiry
-        log.info("Check Point authentication successful")
+        token = None
+        for path in self._TOKEN_FIELD_PATHS:
+            token = self._walk(data, path)
+            if isinstance(token, str) and token:
+                log.debug("Found token at path: %s", ".".join(path))
+                break
+
+        if not token:
+            log.error(
+                "Could not locate a token in the auth response. "
+                "Top-level keys: %s",
+                list(data.keys()) if isinstance(data, dict)
+                else type(data).__name__
+            )
+            if self.debug_http:
+                safe = json.loads(json.dumps(data))
+                self._redact_dict(safe)
+                log.error("Auth response (redacted):\n%s",
+                          json.dumps(safe, indent=2, ensure_ascii=False))
+            raise RuntimeError(
+                "Check Point auth response did not contain a recognizable "
+                "token field. Set logging.debug_http: true to inspect."
+            )
+
+        if token.count(".") != 2:
+            log.warning("Token does not look like a JWT (missing dot "
+                        "segments). Length=%d. Proceeding anyway.",
+                        len(token))
+
+        self.token = token.strip()
+        self.expires_at = time.time() + (25 * 60)
+        log.info("Check Point authentication successful "
+                 "(token length=%d, expires in ~25 min)",
+                 len(self.token))
 
     def _ensure_token(self):
         if not self.token or time.time() > self.expires_at:
             self._authenticate()
 
-    def _headers(self):
-        return {
+    def _headers(self, include_content_type=True):
+        if not self.token:
+            self._authenticate()
+        headers = {
             "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
         }
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _handle_401_retry(self, request_fn):
+        try:
+            return request_fn()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                log.warning("Received 401 — forcing token refresh and retrying")
+                self.token = None
+                self.expires_at = 0
+                self._authenticate()
+                return request_fn()
+            raise
 
     # ---------- feed discovery ----------
 
     def list_feeds(self):
-        """GET /feeds  → returns list of VerboseFeedResponse dicts."""
         self._ensure_token()
         url = f"{self.cp_cfg['api_base_url'].rstrip('/')}/feeds"
-
         log.info("GET %s", url)
 
-        response = None
+        response_holder = {}
+
+        def _do():
+            r = self.session.get(
+                url,
+                headers=self._headers(include_content_type=False),
+                timeout=self.timeout
+            )
+            response_holder["r"] = r
+            r.raise_for_status()
+            return r
+
         try:
-            response = self.session.get(url, headers=self._headers(),
-                                         timeout=self.timeout)
-            response.raise_for_status()
+            response = self._handle_401_retry(_do)
         except requests.exceptions.HTTPError:
-            log_http_error("Check Point list feeds", response, self.debug_http)
+            log_http_error("Check Point list feeds",
+                           response_holder.get("r"), self.debug_http)
             raise
 
         try:
@@ -516,7 +895,6 @@ class CheckPointIOCClient:
         return feeds
 
     def find_feed_id(self, feed_name):
-        """Return feed_id UUID for feed_name (case-insensitive, trimmed)."""
         feeds = self.list_feeds()
 
         if not feeds:
@@ -559,10 +937,6 @@ class CheckPointIOCClient:
     # ---------- indicator listing ----------
 
     def list_indicators(self, feed_id, page_size=500):
-        """
-        GET /feeds/{feed_id}/indicators — paginated.
-        Handles list or {"indicators": [...]} response shapes.
-        """
         self._ensure_token()
         base_url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                     f"/feeds/{feed_id}/indicators")
@@ -572,17 +946,25 @@ class CheckPointIOCClient:
 
         while True:
             params = {"page": page, "pageSize": page_size}
-            response = None
-            try:
-                response = self.session.get(
-                    base_url, headers=self._headers(),
+            response_holder = {}
+
+            def _do():
+                r = self.session.get(
+                    base_url,
+                    headers=self._headers(include_content_type=False),
                     params=params, timeout=self.timeout
                 )
-                response.raise_for_status()
+                response_holder["r"] = r
+                r.raise_for_status()
+                return r
+
+            try:
+                response = self._handle_401_retry(_do)
             except requests.exceptions.HTTPError:
                 log_http_error(
-                    f"Check Point list indicators (feed {feed_id}, page {page})",
-                    response, self.debug_http
+                    f"Check Point list indicators "
+                    f"(feed {feed_id}, page {page})",
+                    response_holder.get("r"), self.debug_http
                 )
                 raise
 
@@ -616,117 +998,191 @@ class CheckPointIOCClient:
                  feed_id, len(all_items))
         return all_items
 
-    # ---------- indicator upload ----------
+    # ---------- indicator upsert ----------
 
-    def upload_indicators(self, feed_id, indicators):
+    def put_indicators(self, feed_id, indicators):
         self._ensure_token()
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                f"/feeds/{feed_id}/indicators")
 
-        response = None
+        response_holder = {}
+
+        def _do():
+            r = self.session.put(
+                url,
+                headers=self._headers(),
+                json=indicators,
+                timeout=self.timeout
+            )
+            response_holder["r"] = r
+            r.raise_for_status()
+            return r
+
         try:
-            response = self.session.post(url, headers=self._headers(),
-                                          json={"indicators": indicators},
-                                          timeout=self.timeout)
-            response.raise_for_status()
+            response = self._handle_401_retry(_do)
         except requests.exceptions.HTTPError:
-            log_http_error(f"Check Point upload to feed {feed_id}",
-                           response, self.debug_http)
+            log_http_error(
+                f"Check Point PUT to feed {feed_id} "
+                f"(batch of {len(indicators)})",
+                response_holder.get("r"), self.debug_http
+            )
             raise
 
         return response.json() if response.content else {}
 
     # ---------- indicator deletion ----------
 
-    def delete_indicators(self, feed_id, indicator_ids=None,
-                          indicator_values=None):
+    @staticmethod
+    def _encode_indicator_value(indicator_type, indicator_value):
+        needs_encoding = indicator_type in ("domain", "url", "ipv4")
+        if not needs_encoding:
+            return indicator_value
+        raw = indicator_value.encode("utf-8")
+        return base64.b64encode(raw).decode("ascii")
+
+    def delete_indicator(self, feed_id, indicator_type, indicator_value):
         self._ensure_token()
+
+        encoded_value = self._encode_indicator_value(
+            indicator_type, indicator_value
+        )
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
-               f"/feeds/{feed_id}/indicators")
+               f"/feeds/{feed_id}/indicators/{indicator_type}/{encoded_value}")
 
-        body = {}
-        if indicator_ids:
-            body["ids"] = indicator_ids
-        elif indicator_values:
-            body["values"] = indicator_values
-        else:
-            raise ValueError("Must supply either indicator_ids or indicator_values")
+        response_holder = {}
 
-        response = None
+        def _do():
+            r = self.session.delete(
+                url,
+                headers=self._headers(include_content_type=False),
+                timeout=self.timeout
+            )
+            response_holder["r"] = r
+            if r.status_code == 404:
+                return r
+            r.raise_for_status()
+            return r
+
         try:
-            response = self.session.delete(url, headers=self._headers(),
-                                            json=body, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._handle_401_retry(_do)
         except requests.exceptions.HTTPError:
-            log_http_error(f"Check Point delete from feed {feed_id}",
-                           response, self.debug_http)
+            log_http_error(
+                f"Check Point DELETE from feed {feed_id} "
+                f"(type={indicator_type}, value={indicator_value})",
+                response_holder.get("r"), self.debug_http
+            )
             raise
 
-        return response.json() if response.content else {}
+        if response.status_code == 404:
+            log.debug("DELETE returned 404 (already absent): %s [%s]",
+                      indicator_value, indicator_type)
+            return {"status": "not_found", "value": indicator_value}
+
+        return {"status": "deleted", "value": indicator_value}
 
 
 # ============================================================
 # INDICATOR TRANSFORMATION (Defender -> Check Point)
 # ============================================================
 
-# Defender severity strings -> Check Point integer scale
 SEVERITY_MAP = {
-    "Informational": 1,
-    "Low":           1,
-    "Medium":        2,
-    "High":          3,
-    "Critical":      4,
-}
-
-# Config string values -> integer
-CONFIDENCE_MAP = {
-    "Low":    1,
-    "Medium": 2,
-    "High":   3,
+    "Informational": 25,
+    "Low":           40,
+    "Medium":        60,
+    "High":          80,
+    "Critical":      95,
 }
 
 SEVERITY_STR_TO_INT = {
-    "Low":      1,
-    "Medium":   2,
-    "High":     3,
-    "Critical": 4,
+    "Low":      40,
+    "Medium":   60,
+    "High":     80,
+    "Critical": 95,
 }
 
+CONFIDENCE_MAP = {
+    "Low":    33,
+    "Medium": 66,
+    "High":   90,
+}
 
-def _to_int(value, mapping, default):
-    """Accept either an already-int value or map a string via the mapping."""
+INFO_MARKER = "source=Microsoft Defender XDR"
+
+_DESC_STRIP_RE = re.compile(r"[\x00-\x1F\x60\x7B-\x7F]")
+_NAME_ALLOW_RE = re.compile(r"[^A-Za-z0-9 _\-]")
+
+
+def _clamp(n, low, high):
+    return max(low, min(high, n))
+
+
+def _to_int_score(value, mapping, default):
     if isinstance(value, int):
-        return value
+        return _clamp(value, 0, 100)
     if isinstance(value, str) and value in mapping:
-        return mapping[value]
-    return default
+        return _clamp(mapping[value], 0, 100)
+    return _clamp(default, 0, 100)
+
+
+def sanitize_description(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _DESC_STRIP_RE.sub(" ", text)
+    return " ".join(cleaned.split())[:512]
+
+
+def sanitize_name(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _NAME_ALLOW_RE.sub("_", text)
+    return cleaned[:64]
 
 
 def defender_to_cp_indicator(d, cp_cfg):
     """
-    Convert a Defender indicator into a Check Point IOC payload.
-    Uses snake_case + integer severity/confidence to match the
-    Check Point Custom IOC Management API schema.
+    Convert a Defender indicator to a Check Point AddIndicatorRequest.
+    Schema (Swagger):
+      indicator_type*  : enum [domain, url, md5, sha1, sha256, ipv4]
+      indicator_value* : string
+      severity         : int 0..100
+      confidence       : int 0..100
+      ttl_in_days      : int 1..100000
+      name             : string [A-Za-z0-9 _-]*
+      enabled          : bool
+      description      : string (control chars, `, {|}~DEL forbidden)
+      info             : string
     """
-    severity_int = SEVERITY_MAP.get(
-        d.get("severity"),
-        _to_int(cp_cfg.get("default_severity"), SEVERITY_STR_TO_INT, 3)
+    value = d["indicatorValue"]
+
+    severity = _to_int_score(
+        SEVERITY_MAP.get(d.get("severity"))
+            or cp_cfg.get("default_severity"),
+        SEVERITY_STR_TO_INT,
+        default=80
     )
-    confidence_int = _to_int(
-        cp_cfg.get("default_confidence"), CONFIDENCE_MAP, 3
+    confidence = _to_int_score(
+        cp_cfg.get("default_confidence"),
+        CONFIDENCE_MAP,
+        default=90
     )
-    ttl_days = int(cp_cfg.get("expiration_days", 30))
+    ttl = _clamp(int(cp_cfg.get("expiration_days", 30)), 1, 100000)
+
+    description = sanitize_description(
+        d.get("description") or d.get("title")
+        or "Imported from Microsoft Defender XDR"
+    )
+    name = sanitize_name(f"MSDefender_{value.replace('.', '_')}")
 
     return {
-        "value":       d["indicatorValue"],
-        "type":        "ip",
-        "action":      cp_cfg.get("default_action", "Prevent"),
-        "severity":    severity_int,
-        "confidence":  confidence_int,
-        "ttl_in_days": ttl_days,
-        "description": d.get("description") or d.get("title") or
-                       "Imported from Microsoft Defender XDR",
-        "source":      "Microsoft Defender XDR",
+        "indicator_type":  "ipv4",
+        "indicator_value": value,
+        "severity":        severity,
+        "confidence":      confidence,
+        "ttl_in_days":     ttl,
+        "name":            name,
+        "enabled":         True,
+        "description":     description,
+        "info":            INFO_MARKER,
     }
 
 
@@ -753,35 +1209,44 @@ def inject_into_checkpoint(session, cfg, ipv4_indicators, summary,
     cp_payloads = [defender_to_cp_indicator(d, cp_cfg)
                    for d in ipv4_indicators]
 
-    # Dedup against existing feed contents
     existing_values = set()
     if existing_indicators is not None:
         for e in existing_indicators:
-            v = e.get("value") or e.get("indicatorValue")
+            v = (e.get("indicator_value")
+                 or e.get("value")
+                 or e.get("indicatorValue"))
             if v:
                 existing_values.add(v)
         summary.cp_existing_count = len(existing_values)
 
     to_upload = []
     for p in cp_payloads:
-        if p["value"] in existing_values:
+        if p["indicator_value"] in existing_values:
             summary.cp_skipped_duplicate += 1
         else:
             to_upload.append(p)
 
-    log.info("Injection plan: %d new, %d duplicates skipped",
+    log.info("Injection plan: %d to upsert, %d unchanged (skipped)",
              len(to_upload), summary.cp_skipped_duplicate)
 
     # ---------- TEST MODE ----------
     if test_mode:
+        num_batches = (len(to_upload) + batch_size - 1) // batch_size
+        est_seconds = num_batches * float(
+            cfg["api"].get("rate_limit_delay_seconds", 0.6))
+
         log.info("=" * 60)
         log.info("*** TEST MODE — no changes will be made ***")
         log.info("=" * 60)
-        log.info("Would authenticate to: %s/auth/external", cp_cfg["auth_url"])
+        log.info("Would PUT to:          %s/feeds/<feed_id>/indicators",
+                 cp_cfg['api_base_url'].rstrip('/'))
         log.info("Would target feed:     %s", feed_name)
         log.info("Would upload:          %d NEW indicators", len(to_upload))
         log.info("Would skip:            %d duplicates",
                  summary.cp_skipped_duplicate)
+        log.info("Batch size:            %d (=> %d batch(es))",
+                 batch_size, num_batches)
+        log.info("Estimated runtime:    ~%.1fs", est_seconds)
 
         preview = to_upload[:5]
         if preview:
@@ -795,10 +1260,12 @@ def inject_into_checkpoint(session, cfg, ipv4_indicators, summary,
         preview_path = out_dir / f"checkpoint_test_preview_{ts}.json"
         with open(preview_path, "w", encoding="utf-8") as f:
             json.dump({
+                "http_method": "PUT",
                 "feed_name": feed_name,
                 "total_new_indicators": len(to_upload),
                 "duplicates_skipped": summary.cp_skipped_duplicate,
                 "batch_size": batch_size,
+                "batch_count": num_batches,
                 "indicators": to_upload
             }, f, indent=2)
         log.info("Full preview written to: %s", preview_path)
@@ -806,21 +1273,30 @@ def inject_into_checkpoint(session, cfg, ipv4_indicators, summary,
         return
 
     # ---------- REAL RUN ----------
-    for start in range(0, len(to_upload), batch_size):
+    total = len(to_upload)
+    num_batches = (total + batch_size - 1) // batch_size
+
+    log.info("Uploading %d indicators in %d batch(es) of up to %d",
+             total, num_batches, batch_size)
+
+    for start in range(0, total, batch_size):
         batch = to_upload[start:start + batch_size]
         batch_num = (start // batch_size) + 1
-        log.info("Uploading batch %d (%d indicators)", batch_num, len(batch))
+        log.info("PUT batch %d/%d (%d indicators)",
+                 batch_num, num_batches, len(batch))
+
         try:
-            cp_client.upload_indicators(summary.cp_feed_id, batch)
+            cp_client.put_indicators(summary.cp_feed_id, batch)
             summary.cp_added += len(batch)
         except Exception as e:
             summary.cp_failed_add += len(batch)
             err = f"Batch {batch_num}: {type(e).__name__}: {e}"
             summary.cp_add_errors.append(err)
             log.error(err)
+
         time.sleep(cfg["api"]["rate_limit_delay_seconds"])
 
-    log.info("Injection complete: %d added, %d failed",
+    log.info("Injection complete: %d upserted, %d failed",
              summary.cp_added, summary.cp_failed_add)
 
 
@@ -845,29 +1321,40 @@ def cleanup_stale_from_checkpoint(cfg, ipv4_indicators, summary,
         return
 
     defender_values = {
-        d["indicatorValue"] for d in ipv4_indicators if d.get("indicatorValue")
+        d["indicatorValue"] for d in ipv4_indicators
+        if d.get("indicatorValue")
     }
 
     stale = []
     require_source = cleanup_cfg.get("require_source_match", True)
-    expected_source = "Microsoft Defender XDR"
 
     for e in existing_indicators:
-        value = e.get("value") or e.get("indicatorValue")
-        source = e.get("source", "")
-        indicator_id = (e.get("id") or e.get("_id")
-                        or e.get("indicatorId") or e.get("indicator_id"))
+        value = (e.get("indicator_value")
+                 or e.get("value")
+                 or e.get("indicatorValue"))
+        info = e.get("info", "") or ""
+        indicator_id = (e.get("indicator_id")
+                        or e.get("id")
+                        or e.get("_id")
+                        or e.get("indicatorId"))
+        itype = e.get("indicator_type", "ipv4")
 
         if not value:
             continue
         if value in defender_values:
             continue
-        if require_source and source != expected_source:
-            log.debug("Preserving IOC %s from source %s (not ours)",
-                      value, source)
+
+        if require_source and INFO_MARKER not in info:
+            log.debug("Preserving IOC %s — info=%r doesn't match our marker",
+                      value, info)
             continue
 
-        stale.append({"id": indicator_id, "value": value, "source": source})
+        stale.append({
+            "id": indicator_id,
+            "value": value,
+            "info": info,
+            "indicator_type": itype,
+        })
 
     summary.cp_stale_identified = len(stale)
     log.info("Cleanup: %d stale indicators identified", len(stale))
@@ -888,11 +1375,14 @@ def cleanup_stale_from_checkpoint(cfg, ipv4_indicators, summary,
 
     # ---------- TEST MODE ----------
     if test_mode:
+        est_seconds = len(stale) * float(
+            cfg["api"].get("rate_limit_delay_seconds", 0.6))
         log.info("=" * 60)
         log.info("*** TEST MODE — no deletions will be performed ***")
         log.info("=" * 60)
-        log.info("Would delete %d stale indicators from feed '%s'",
-                 len(stale), summary.cp_feed_name)
+        log.info("Would delete %d stale indicators from feed '%s' "
+                 "(1 API call each, ~%.1fs estimated)",
+                 len(stale), summary.cp_feed_name, est_seconds)
         preview = stale[:10]
         log.info("Sample stale indicators (first %d of %d):\n%s",
                  len(preview), len(stale),
@@ -912,29 +1402,34 @@ def cleanup_stale_from_checkpoint(cfg, ipv4_indicators, summary,
         return
 
     # ---------- REAL DELETE ----------
-    batch_size = int(cp_cfg.get("batch_size", 100))
-    for start in range(0, len(stale), batch_size):
-        batch = stale[start:start + batch_size]
-        batch_num = (start // batch_size) + 1
+    per_call_delay = float(cfg["api"].get("rate_limit_delay_seconds", 0.6))
+    total = len(stale)
 
-        ids = [s["id"] for s in batch if s.get("id")]
-        values = [s["value"] for s in batch if s.get("value")]
+    log.info("Deleting %d stale indicators one at a time "
+             "(API supports single-indicator delete only)", total)
 
-        log.info("Deleting batch %d (%d indicators)", batch_num, len(batch))
+    for idx, item in enumerate(stale, start=1):
+        value = item["value"]
+        indicator_type = item.get("indicator_type", "ipv4")
+
         try:
-            if ids:
-                cp_client.delete_indicators(summary.cp_feed_id,
-                                            indicator_ids=ids)
-            else:
-                cp_client.delete_indicators(summary.cp_feed_id,
-                                            indicator_values=values)
-            summary.cp_deleted += len(batch)
+            cp_client.delete_indicator(
+                summary.cp_feed_id, indicator_type, value
+            )
+            summary.cp_deleted += 1
+
+            if idx % 25 == 0 or idx == total:
+                log.info("Progress: %d/%d deleted (%d ok, %d failed)",
+                         idx, total, summary.cp_deleted,
+                         summary.cp_failed_delete)
         except Exception as e:
-            summary.cp_failed_delete += len(batch)
-            err = f"Delete batch {batch_num}: {type(e).__name__}: {e}"
+            summary.cp_failed_delete += 1
+            err = (f"Delete {idx}/{total} ({value}): "
+                   f"{type(e).__name__}: {e}")
             summary.cp_delete_errors.append(err)
             log.error(err)
-        time.sleep(cfg["api"]["rate_limit_delay_seconds"])
+
+        time.sleep(per_call_delay)
 
     log.info("Cleanup complete: %d deleted, %d failed",
              summary.cp_deleted, summary.cp_failed_delete)
@@ -1028,6 +1523,13 @@ def parse_args():
         help="Path to configuration file (default: config.yaml)"
     )
     parser.add_argument(
+        "-i", "--input-file",
+        help="Load Defender indicators from a local JSON or CSV file "
+             "instead of calling the Defender API. Supports raw export "
+             "format, single-page envelope, plain array, single object, "
+             "or CSV with header row (columns auto-mapped)."
+    )
+    parser.add_argument(
         "--skip-checkpoint", action="store_true",
         help="Skip Check Point injection and cleanup entirely."
     )
@@ -1068,12 +1570,29 @@ def main():
 
     summary = RunSummary(test_mode=args.test)
     session = build_session()
-    token_manager = TokenManager(session, cfg)
+
+    # Only build a Defender token manager if we're going to hit the API
+    token_manager = None
+    if not args.input_file:
+        token_manager = TokenManager(session, cfg)
 
     exit_code = 0
     try:
-        # 1. Pull from Defender
-        indicators, raw_pages = get_all_indicators(session, token_manager, cfg)
+        # 1. Load indicators — either from Defender API or from an input file
+        if args.input_file:
+            log.info("=" * 60)
+            log.info("OFFLINE MODE: loading indicators from file "
+                     "(Defender API will NOT be called)")
+            log.info("Source file: %s", args.input_file)
+            log.info("=" * 60)
+            summary.source = "file"
+            summary.source_path = args.input_file
+            indicators, raw_pages = load_indicators_from_file(args.input_file)
+        else:
+            log.info("Loading indicators from Defender XDR API")
+            indicators, raw_pages = get_all_indicators(
+                session, token_manager, cfg
+            )
 
         # 2. Export files
         paths = build_output_paths(cfg)
