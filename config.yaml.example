@@ -1,8 +1,7 @@
 # ============================================================
 # Defender XDR → Check Point IOC Management
-# Configuration File
+# Configuration File (POC mode — inline secrets)
 # ============================================================
-# POC MODE: sensitive values are stored inline.
 # Before production:
 #   - chmod 600 config.yaml
 #   - Never commit to source control (.gitignore it)
@@ -21,51 +20,58 @@ api:
   indicator_url: "https://api.securitycenter.microsoft.com/api/indicators"
   scope: "https://api.securitycenter.microsoft.com/.default"
   request_timeout_seconds: 60
-  rate_limit_delay_seconds: 0.6
+  # Check Point IOC API rate limit is 50 requests/minute per Swagger.
+  # 60/50 = 1.2s minimum between requests.
+  rate_limit_delay_seconds: 1.2
 
 # ---------- Check Point IOC Management ----------
+# Regional endpoints (pick your region):
+#   EU:  https://cloudinfra-gw.portal.checkpoint.com
+#   AU:  https://cloudinfra-gw.ap.portal.checkpoint.com
+#   CA:  https://cloudinfra-gw.ca.portal.checkpoint.com
+#   US:  https://cloudinfra-gw.us.portal.checkpoint.com
 checkpoint:
   enabled: true
-
-  # From Check Point Portal → Global Settings → API Keys →
-  # service "Centralized IOC Management"
-  # Customised for Canadian Porta
-  auth_url: "https://cloudinfra-gw.ca.portal.checkpoint.com"
-  api_base_url: "https://cloudinfra-gw.ca.portal.checkpoint.com/app/ioc-management"
+  auth_url: "https://cloudinfra-gw.portal.checkpoint.com"
+  api_base_url: "https://cloudinfra-gw.portal.checkpoint.com/app/ioc-management"
   client_id: "your-checkpoint-client-id"
   access_key: "your-checkpoint-access-key"
 
-  # Manual feed pre-created in the IOC Management portal
-  # (Inputs → Custom Manual Feeds → Add feed)
   feed_name: "MSDefender_Autofeed"
 
-  # Batch size for PUT (upsert). Deletes are one-at-a-time by API design.
   batch_size: 100
-
-  # Accepts strings ("Low"|"Medium"|"High"|"Critical") OR ints 0..100
-  default_severity: "High"          # -> 80
-  default_confidence: "High"        # -> 90
+  default_severity: "High"          # "Low"|"Medium"|"High"|"Critical" or 0..100
+  default_confidence: "High"        # "Low"|"Medium"|"High"            or 0..100
   expiration_days: 30               # maps to ttl_in_days (1..100000)
 
-  # Cleanup: remove IOCs from CP that are no longer in Defender
-  cleanup:
-    enabled: false                  # opt-in
-    require_source_match: true      # only delete IOCs with our info marker
-    max_delete_per_run: 500         # safety cap
+  # Ask for verbose feed metadata (includes total_indicators, etc.)
+  verbose_feeds: true
 
-# ---------- Filters ----------
+  # Which IOC types to sync into Check Point.
+  # Set any to false to skip that entire type.
+  supported_types:
+    ipv4:   true    # Defender IpAddress   → CP ipv4 (IPv6 always skipped)
+    domain: true    # Defender DomainName  → CP domain
+    url:    true    # Defender Url         → CP url
+    md5:    true    # Defender FileMd5     → CP md5
+    sha1:   true    # Defender FileSha1    → CP sha1
+    sha256: true    # Defender FileSha256  → CP sha256
+
+  cleanup:
+    enabled: false
+    max_delete_per_run: 500
+
 filters:
   exclude_expired: true
 
-# ---------- Output ----------
 output:
   directory: "./exports"
   raw_json_prefix: "defender_threat_indicators_raw"
   csv_prefix: "defender_threat_indicators"
   txt_prefix: "defender_threat_indicators"
   summary_prefix: "run_summary"
+  state_file: "cp_ioc_state.json"
 
-# ---------- Logging ----------
 logging:
   level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
   debug_http: true                  # include full HTTP error bodies in logs
