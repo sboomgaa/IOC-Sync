@@ -70,6 +70,7 @@ output:
   csv_prefix: "defender_threat_indicators"
   txt_prefix: "defender_threat_indicators"
   summary_prefix: "run_summary"
+  uncreated_prefix: "uncreated_indicators"     # NEW: audit report of IOCs not in CP
   state_file: "cp_ioc_state.json"
 
 logging:

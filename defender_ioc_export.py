@@ -7,16 +7,12 @@ a local JSON/CSV file), upserts supported IOC types into a Check Point IOC
 Management feed via PUT (batched), and optionally deletes stale IOCs via
 POST /feeds/{feed_id}/indicators/delete (batched).
 
-Supported IOC types (Defender -> Check Point):
-    IpAddress   -> ipv4    (IPv4 only; IPv6 skipped)
-    DomainName  -> domain
-    Url         -> url
-    FileMd5     -> md5
-    FileSha1    -> sha1
-    FileSha256  -> sha256
-    (CertificateThumbprint has no Check Point equivalent and is skipped.)
-
 Aligned to Check Point Custom IOC Management API v1.0.3.
+
+Any Defender IOC that does NOT successfully land in Check Point (filtered
+out, rejected, batch-failed, partial-failed, or silently dropped by the CP
+API) is captured to an audit report with the raw Defender JSON so nothing
+disappears silently.
 
 Usage:
     python defender_ioc_export.py                    # normal run
@@ -126,6 +122,39 @@ def load_config(path="config.yaml"):
 
 
 # ============================================================
+# UNCREATED IOC TRACKING
+# ============================================================
+# Any Defender IOC that does NOT successfully land in Check Point ends up
+# here, with its raw JSON preserved plus a reason/detail annotation.
+# Reasons used:
+#   filter_unmapped_type      - Defender type has no CP equivalent
+#   filter_type_disabled      - CP type is disabled in config
+#   filter_bad_value          - Value failed per-type validation
+#   injection_batch_failed    - Entire PUT batch threw an exception
+#   injection_partial_failed  - CP returned non-2xx status for this item
+#   injection_silently_dropped- Sent to CP but not present in response
+
+_UNCREATED_REASONS = (
+    "filter_unmapped_type",
+    "filter_type_disabled",
+    "filter_bad_value",
+    "injection_batch_failed",
+    "injection_partial_failed",
+    "injection_silently_dropped",
+)
+
+
+def _make_uncreated_entry(raw, reason, detail, cp_type=None):
+    """Wrap a raw Defender indicator with audit metadata."""
+    return {
+        "_uncreated_reason": reason,
+        "_uncreated_detail": detail,
+        "_cp_type_attempted": cp_type,
+        "raw": raw,
+    }
+
+
+# ============================================================
 # RUN SUMMARY TRACKER
 # ============================================================
 
@@ -153,8 +182,14 @@ class RunSummary:
         self.cp_state_count = 0
         self.cp_added = 0
         self.cp_partial_failed = 0
+        self.cp_silently_dropped = 0
         self.cp_failed_add = 0
         self.cp_add_errors = []
+
+        # Uncreated IOC tracking
+        self.uncreated_total = 0
+        self.uncreated_by_reason = {r: 0 for r in _UNCREATED_REASONS}
+        self.uncreated_report_path = None
 
         self.cleanup_enabled = False
         self.cp_stale_identified = 0
@@ -199,8 +234,15 @@ class RunSummary:
                 "state_tracked":     self.cp_state_count,
                 "added":             self.cp_added,
                 "partial_failed":    self.cp_partial_failed,
+                "silently_dropped":  self.cp_silently_dropped,
                 "failed":            self.cp_failed_add,
                 "errors":            self.cp_add_errors[:20],
+            },
+            "uncreated": {
+                "total":              self.uncreated_total,
+                "by_reason":          self.uncreated_by_reason,
+                "report_path":        (str(self.uncreated_report_path)
+                                       if self.uncreated_report_path else None),
             },
             "checkpoint_cleanup": {
                 "enabled":          self.cleanup_enabled,
@@ -244,7 +286,15 @@ class RunSummary:
         log.info("Tracked in state:         %d", self.cp_state_count)
         log.info("Upserted:                 %d", self.cp_added)
         log.info("Partial failures:         %d", self.cp_partial_failed)
-        log.info("Failed:                   %d", self.cp_failed_add)
+        log.info("Silently dropped:         %d", self.cp_silently_dropped)
+        log.info("Batch failures:           %d", self.cp_failed_add)
+        log.info("")
+        log.info("--- Uncreated (Defender IOCs NOT in Check Point) ---")
+        log.info("Total uncreated:          %d", self.uncreated_total)
+        log.info("By reason:                %s",
+                 {k: v for k, v in self.uncreated_by_reason.items() if v})
+        if self.uncreated_report_path:
+            log.info("Audit report:             %s", self.uncreated_report_path)
         log.info("")
         log.info("--- Check Point Cleanup ---")
         log.info("Cleanup enabled:          %s", self.cleanup_enabled)
@@ -266,24 +316,74 @@ def write_summary_report(summary: RunSummary, cfg: dict) -> Path:
     return path
 
 
+def write_uncreated_report(uncreated, summary, cfg) -> Path:
+    """
+    Persist the audit list of IOCs pulled from Defender but not created
+    in Check Point. Always written (even if empty) so downstream jobs can
+    depend on the file existing.
+    """
+    out_dir = Path(cfg["output"]["directory"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = summary.started_at.strftime("%Y%m%dT%H%M%SZ")
+    prefix = cfg["output"].get("uncreated_prefix", "uncreated_indicators")
+    path = out_dir / f"{prefix}_{ts}.json"
+
+    # Recompute counts by reason from the actual list (source of truth)
+    by_reason = {r: 0 for r in _UNCREATED_REASONS}
+    for item in uncreated:
+        r = item.get("_uncreated_reason", "unknown")
+        by_reason[r] = by_reason.get(r, 0) + 1
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_started_at": summary.started_at.isoformat(),
+        "test_mode": summary.test_mode,
+        "source": summary.source,
+        "source_path": summary.source_path,
+        "feed_name": summary.cp_feed_name,
+        "feed_id": summary.cp_feed_id,
+        "totals": {
+            "defender_total": summary.defender_total,
+            "cp_created": summary.cp_added,
+            "uncreated": len(uncreated),
+        },
+        "by_reason": by_reason,
+        "reason_glossary": {
+            "filter_unmapped_type":
+                "Defender indicatorType has no Check Point equivalent",
+            "filter_type_disabled":
+                "The mapped Check Point type is disabled in config.yaml",
+            "filter_bad_value":
+                "Value failed per-type validation (e.g. bad domain, non-hex hash)",
+            "injection_batch_failed":
+                "The PUT batch containing this IOC threw an HTTP/network error",
+            "injection_partial_failed":
+                "Check Point returned a non-2xx status for this specific IOC",
+            "injection_silently_dropped":
+                "Sent to Check Point in a batch, but not present in the response "
+                "(likely deduped server-side)",
+        },
+        "indicators": uncreated,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    log.info("Uncreated indicators report written: %s (%d items)",
+             path, len(uncreated))
+    return path
+
+
 # ============================================================
 # LOCAL STATE (tracks IOCs we've sent to Check Point)
 # ============================================================
-#
-# The CP IOC API does not expose a GET on /feeds/{id}/indicators, so we
-# track what we've sent in a local JSON file. State is keyed by feed_id,
-# then by a composite key "<indicator_type>:<indicator_value>" so we can
-# safely mix types without collisions.
 
 def _state_key(cp_type, value):
     return f"{cp_type}:{value}"
 
 
 def _migrate_state_if_needed(state):
-    """
-    Convert legacy state (bare value → entry) to composite key format.
-    Idempotent: skips entries that already use the new format.
-    """
+    """Convert legacy state (bare value → entry) to composite key format."""
     known_types = {"ipv4", "domain", "url", "md5", "sha1", "sha256"}
     total_migrated = 0
 
@@ -299,7 +399,6 @@ def _migrate_state_if_needed(state):
             if head in known_types:
                 new[key] = entry
                 continue
-            # Legacy: key is a bare value; type sits inside the entry
             itype = (entry or {}).get("indicator_type", "ipv4")
             new_key = _state_key(itype, key)
             new[new_key] = entry
@@ -682,22 +781,19 @@ def load_indicators_from_file(path):
 # INDICATOR TYPE MAPPING & VALIDATION
 # ============================================================
 
-# Check Point IOC types: domain, url, md5, sha1, sha256, ipv4
 DEFENDER_TO_CP_TYPE = {
-    "IpAddress":  "ipv4",     # requires IPv4 (IPv6 rejected downstream)
+    "IpAddress":  "ipv4",
     "DomainName": "domain",
     "Url":        "url",
     "FileMd5":    "md5",
     "FileSha1":   "sha1",
     "FileSha256": "sha256",
-    # "CertificateThumbprint" → no CP equivalent → skipped
 }
 
 _HEX_MD5_RE    = re.compile(r"^[a-fA-F0-9]{32}$")
 _HEX_SHA1_RE   = re.compile(r"^[a-fA-F0-9]{40}$")
 _HEX_SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 
-# RFC-1035-ish: labels 1-63 chars, total ≤253, TLD alpha 2-63
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)"
     r"(?:[A-Za-z0-9-]{0,61}[A-Za-z0-9]?\.)+"
@@ -708,7 +804,6 @@ _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
 def is_valid_ipv4(value: str) -> bool:
-    """Return True if value is a valid public IPv4 (single host, not CIDR)."""
     if not value:
         return False
     try:
@@ -751,7 +846,6 @@ def is_valid_hash(v, kind):
 
 
 def validate_indicator_value(cp_type, value):
-    """Return True if the value is well-formed for the given CP type."""
     if cp_type == "ipv4":
         return is_valid_ipv4(value)
     if cp_type == "domain":
@@ -764,7 +858,6 @@ def validate_indicator_value(cp_type, value):
 
 
 def _canonicalize_value(cp_type, value):
-    """Normalize the value the way Check Point should store it."""
     v = (value or "").strip()
     if cp_type == "domain":
         return v.lower()
@@ -777,15 +870,11 @@ def _canonicalize_value(cp_type, value):
 # FILTERING (all supported IOC types)
 # ============================================================
 
-def filter_supported_indicators(indicators, cp_cfg, summary):
+def filter_supported_indicators(indicators, cp_cfg, summary,
+                                 uncreated_collection=None):
     """
-    Filter a Defender indicator list down to those we can send to Check Point.
-    Annotates each surviving indicator with `_cp_type` and `_cp_value`.
-
-    Skips:
-      - Unmapped Defender types (e.g. CertificateThumbprint)
-      - Types disabled in config (checkpoint.supported_types.<type>: false)
-      - Invalid values (bad domains, non-hex hashes, IPv6, private IPs, etc.)
+    Filter Defender indicators. Also collects rejected raw JSON into
+    `uncreated_collection` if provided.
     """
     supported_cfg = cp_cfg.get("supported_types", {}) or {}
     supported = []
@@ -802,17 +891,35 @@ def filter_supported_indicators(indicators, cp_cfg, summary):
         cp_type = DEFENDER_TO_CP_TYPE.get(d_type)
         if not cp_type:
             counts_unmapped[d_type] = counts_unmapped.get(d_type, 0) + 1
+            if uncreated_collection is not None:
+                uncreated_collection.append(_make_uncreated_entry(
+                    i, "filter_unmapped_type",
+                    f"Defender indicatorType {d_type!r} has no Check Point equivalent"
+                ))
             continue
 
-        # Config gate — treat unspecified as enabled (safer default)
         if supported_cfg.get(cp_type, True) is False:
             counts_disabled[cp_type] = counts_disabled.get(cp_type, 0) + 1
+            if uncreated_collection is not None:
+                uncreated_collection.append(_make_uncreated_entry(
+                    i, "filter_type_disabled",
+                    f"Check Point type {cp_type!r} is disabled in config.yaml "
+                    "(checkpoint.supported_types)",
+                    cp_type=cp_type
+                ))
             continue
 
         canon_value = _canonicalize_value(cp_type, value)
         if not validate_indicator_value(cp_type, canon_value):
             counts_bad_value[cp_type] = counts_bad_value.get(cp_type, 0) + 1
             log.debug("Rejected invalid %s value: %r", cp_type, value)
+            if uncreated_collection is not None:
+                uncreated_collection.append(_make_uncreated_entry(
+                    i, "filter_bad_value",
+                    f"Value {value!r} failed validation for Check Point type "
+                    f"{cp_type!r}",
+                    cp_type=cp_type
+                ))
             continue
 
         enriched = dict(i)
@@ -847,19 +954,6 @@ def filter_supported_indicators(indicators, cp_cfg, summary):
 # ============================================================
 
 class CheckPointIOCClient:
-    """
-    Endpoints used:
-      POST   {auth_url}/auth/external                                 (auth)
-      GET    {api_base}/feeds?verbose={bool}                          (list feeds)
-      PUT    {api_base}/feeds/{feed_id}/indicators                    (batch upsert)
-      POST   {api_base}/feeds/{feed_id}/indicators/delete             (batch delete)
-      DELETE {api_base}/feeds/{feed_id}/indicators/{type}/{b64_value} (single delete)
-
-    Rate limit: 50 requests/minute (per spec).
-    Auth response: {"success": true, "data": {"token": "<JWT>"}}
-    JWT TTL: 30 minutes.
-    """
-
     _TOKEN_FIELD_PATHS = (
         ("data", "token"),
         ("token",),
@@ -878,8 +972,6 @@ class CheckPointIOCClient:
         self.timeout = cfg["api"]["request_timeout_seconds"]
         self.token = None
         self.expires_at = 0
-
-    # ---------- authentication ----------
 
     @staticmethod
     def _walk(d, path):
@@ -904,7 +996,6 @@ class CheckPointIOCClient:
                 CheckPointIOCClient._redact_dict(v)
 
     def _authenticate(self):
-        # Auth endpoint is on the ROOT domain, NOT under /app/ioc-management/
         auth_endpoint = f"{self.cp_cfg['auth_url'].rstrip('/')}/auth/external"
         payload = {
             "clientId": self.cp_cfg["client_id"],
@@ -944,18 +1035,14 @@ class CheckPointIOCClient:
                 break
 
         if not token:
-            log.error("Could not locate a token in the auth response. "
-                      "Top-level keys: %s",
-                      list(data.keys()) if isinstance(data, dict)
-                      else type(data).__name__)
+            log.error("Could not locate a token in the auth response.")
             if self.debug_http:
                 safe = json.loads(json.dumps(data))
                 self._redact_dict(safe)
                 log.error("Auth response (redacted):\n%s",
                           json.dumps(safe, indent=2, ensure_ascii=False))
             raise RuntimeError(
-                "Check Point auth response did not contain a recognizable "
-                "token field."
+                "Check Point auth response did not contain a token field."
             )
 
         if token.count(".") != 2:
@@ -998,7 +1085,6 @@ class CheckPointIOCClient:
     # ---------- feed discovery ----------
 
     def list_feeds(self, verbose=None):
-        """GET /feeds?verbose={bool}"""
         self._ensure_token()
 
         if verbose is None:
@@ -1029,12 +1115,10 @@ class CheckPointIOCClient:
         try:
             data = response.json()
         except ValueError:
-            log.error("GET /feeds did not return JSON. Body: %s",
-                      response.text[:2000])
+            log.error("GET /feeds did not return JSON.")
             raise
 
         feeds = data.get("feeds", []) if isinstance(data, dict) else []
-        log.debug("GET /feeds returned %d feeds", len(feeds))
         return feeds
 
     def find_feed_id(self, feed_name):
@@ -1047,10 +1131,8 @@ class CheckPointIOCClient:
         for f in feeds:
             log.info(
                 "  - name=%r  id=%s  type=%s  enabled=%s  indicators=%s",
-                f.get("feed_name"),
-                f.get("feed_id"),
-                f.get("feed_type"),
-                f.get("enabled"),
+                f.get("feed_name"), f.get("feed_id"),
+                f.get("feed_type"), f.get("enabled"),
                 f.get("total_indicators"),
             )
 
@@ -1062,8 +1144,7 @@ class CheckPointIOCClient:
                 if not f.get("enabled"):
                     log.warning("Feed %r is DISABLED", feed_name)
                 if f.get("feed_type") != "MANUAL":
-                    log.warning("Feed %r has feed_type=%s (expected MANUAL). "
-                                "The API may reject writes.",
+                    log.warning("Feed %r has feed_type=%s (expected MANUAL).",
                                 feed_name, f.get("feed_type"))
                 log.info("Matched feed %r -> feed_id=%s", feed_name, fid)
                 return fid
@@ -1072,45 +1153,56 @@ class CheckPointIOCClient:
                   feed_name, [f.get("feed_name") for f in feeds])
         return None
 
-    # ---------- helpers for parsing IndicatorsResponse ----------
+    # ---------- response parsing ----------
 
     @staticmethod
-    def _summarize_indicators_response(resp_json):
+    def _parse_indicators_response(resp_json):
         """
-        Parse an IndicatorsResponse:
-          {
-            "indicators": [
-              {"indicator": {...}, "status": <int>},
-              ...
-            ],
-            "batch_id": "<uuid>"
-          }
-        Returns (num_ok, num_failed, failed_items).
+        Parse an IndicatorsResponse into a structured breakdown.
+        Returns dict with:
+          - ok_pairs:      set of (type, value) that returned 2xx
+          - failed_items:  list of {status, indicator_type, indicator_value}
+          - ack_pairs:     set of ALL (type, value) present in the response
+          - parseable:     True if response had the expected shape
         """
+        result = {
+            "ok_pairs": set(),
+            "failed_items": [],
+            "ack_pairs": set(),
+            "parseable": False,
+        }
         if not isinstance(resp_json, dict):
-            return None, None, []
-        items = resp_json.get("indicators", [])
+            return result
+        items = resp_json.get("indicators")
         if not isinstance(items, list):
-            return None, None, []
-        ok = 0
-        failed = []
+            return result
+
+        result["parseable"] = True
         for it in items:
-            status = it.get("status", 200) if isinstance(it, dict) else 500
-            ind = it.get("indicator", {}) if isinstance(it, dict) else {}
-            if 200 <= status < 300:
-                ok += 1
+            if not isinstance(it, dict):
+                continue
+            ind = it.get("indicator") if isinstance(it.get("indicator"), dict) else {}
+            itype = ind.get("indicator_type")
+            ivalue = ind.get("indicator_value")
+            status = it.get("status", 200)
+            pair = (itype, ivalue)
+
+            if itype is not None and ivalue is not None:
+                result["ack_pairs"].add(pair)
+
+            if 200 <= int(status) < 300:
+                result["ok_pairs"].add(pair)
             else:
-                failed.append({
+                result["failed_items"].append({
                     "status": status,
-                    "indicator_value": ind.get("indicator_value"),
-                    "indicator_type": ind.get("indicator_type"),
+                    "indicator_type": itype,
+                    "indicator_value": ivalue,
                 })
-        return ok, len(failed), failed
+        return result
 
     # ---------- indicator upsert ----------
 
     def put_indicators(self, feed_id, indicators):
-        """PUT /feeds/{feed_id}/indicators — batch upsert."""
         self._ensure_token()
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                f"/feeds/{feed_id}/indicators")
@@ -1140,11 +1232,6 @@ class CheckPointIOCClient:
     # ---------- indicator batch deletion ----------
 
     def delete_indicators_batch(self, feed_id, indicator_pairs):
-        """
-        POST /feeds/{feed_id}/indicators/delete — batch delete.
-        Body: array of {indicator_type, indicator_value} objects.
-        Returns IndicatorsResponse.
-        """
         self._ensure_token()
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                f"/feeds/{feed_id}/indicators/delete")
@@ -1181,7 +1268,6 @@ class CheckPointIOCClient:
 
     @staticmethod
     def _encode_indicator_value(indicator_type, indicator_value):
-        """Per spec: domain/url/ipv4 values must be base64-encoded in path."""
         needs_encoding = indicator_type in ("domain", "url", "ipv4")
         if not needs_encoding:
             return indicator_value
@@ -1189,7 +1275,6 @@ class CheckPointIOCClient:
         return base64.b64encode(raw).decode("ascii")
 
     def delete_indicator(self, feed_id, indicator_type, indicator_value):
-        """DELETE /feeds/{feed_id}/indicators/{type}/{value}"""
         self._ensure_token()
         encoded_value = self._encode_indicator_value(
             indicator_type, indicator_value)
@@ -1281,17 +1366,11 @@ def sanitize_name(text: str) -> str:
 
 
 def _make_cp_indicator_name(cp_type, value):
-    """Build a schema-compliant name: [A-Za-z0-9 _-]*, ≤ 64 chars."""
     safe = re.sub(r"[^A-Za-z0-9]", "_", value)
     return sanitize_name(f"MSDefender_{cp_type}_{safe}")
 
 
 def defender_to_cp_indicator(d, cp_cfg):
-    """
-    Convert an annotated Defender indicator (with _cp_type / _cp_value
-    added by filter_supported_indicators) into a Check Point
-    AddIndicatorRequest payload.
-    """
     cp_type = d.get("_cp_type")
     value   = d.get("_cp_value") or d.get("indicatorValue")
     if not cp_type:
@@ -1337,7 +1416,16 @@ def defender_to_cp_indicator(d, cp_cfg):
 
 def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                             test_mode=False, cp_client=None,
-                            state=None, state_path=None):
+                            state=None, state_path=None,
+                            uncreated_collection=None):
+    """
+    Upsert supported indicators to Check Point.
+
+    Detects and reports (via uncreated_collection):
+      - Batch-level failures (entire PUT threw)
+      - Partial failures (CP returned non-2xx for individual items)
+      - Silent drops (sent to CP but not in the response)
+    """
     cp_cfg = cfg["checkpoint"]
 
     if not cp_cfg.get("enabled"):
@@ -1351,8 +1439,15 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
     feed_id = summary.cp_feed_id
     batch_size = int(cp_cfg.get("batch_size", 100))
 
-    cp_payloads = [defender_to_cp_indicator(d, cp_cfg)
-                   for d in supported_indicators]
+    # Build parallel lists so we can map (type, value) back to the raw Defender IOC
+    cp_payloads = []
+    raw_by_pair = {}
+    for d in supported_indicators:
+        payload = defender_to_cp_indicator(d, cp_cfg)
+        cp_payloads.append(payload)
+        raw_by_pair[(payload["indicator_type"],
+                     payload["indicator_value"])] = d
+
     total = len(cp_payloads)
     num_batches = (total + batch_size - 1) // batch_size
 
@@ -1378,7 +1473,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                  batch_size, num_batches)
         log.info("Estimated runtime:    ~%.1fs at 50 rpm", est_seconds)
 
-        # Show one sample per type present in the batch, if possible
         by_type = {}
         for p in cp_payloads:
             by_type.setdefault(p["indicator_type"], p)
@@ -1415,40 +1509,88 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
     for start in range(0, total, batch_size):
         batch = cp_payloads[start:start + batch_size]
         batch_num = (start // batch_size) + 1
-        log.info("PUT batch %d/%d (%d indicators)",
-                 batch_num, num_batches, len(batch))
+        all_pairs = {(p["indicator_type"], p["indicator_value"])
+                     for p in batch}
+
+        log.info("PUT batch %d/%d (%d indicators, %d unique pairs)",
+                 batch_num, num_batches, len(batch), len(all_pairs))
+
+        # Detect intra-batch duplicates up front (info only)
+        if len(batch) != len(all_pairs):
+            dupes_in_batch = len(batch) - len(all_pairs)
+            log.warning("Batch %d contains %d intra-batch duplicate (type,value) pairs — "
+                        "Check Point will dedupe these",
+                        batch_num, dupes_in_batch)
 
         try:
             resp = cp_client.put_indicators(feed_id, batch)
-            ok, failed_count, failed_items = \
-                CheckPointIOCClient._summarize_indicators_response(resp)
+            parsed = CheckPointIOCClient._parse_indicators_response(resp)
 
-            # Track successes by (type, value) so unrelated types don't collide
-            all_pairs = {(p["indicator_type"], p["indicator_value"])
-                         for p in batch}
-
-            if ok is None:
-                # Non-standard response — treat batch as fully successful
-                summary.cp_added += len(batch)
+            if not parsed["parseable"]:
+                # Non-standard response — best-effort assume success
+                summary.cp_added += len(all_pairs)
                 successful_pairs = all_pairs
+                log.warning("Batch %d: response shape unrecognized — "
+                            "assuming all %d succeeded",
+                            batch_num, len(all_pairs))
             else:
-                summary.cp_added += ok
-                summary.cp_partial_failed += failed_count
-                failed_pairs = {(fi.get("indicator_type"),
-                                 fi.get("indicator_value"))
-                                for fi in (failed_items or [])}
-                successful_pairs = all_pairs - failed_pairs
+                ok_pairs      = parsed["ok_pairs"]
+                failed_items  = parsed["failed_items"]
+                ack_pairs     = parsed["ack_pairs"]
+
+                # Silent drops = sent (unique) but not present in response
+                silently_dropped = all_pairs - ack_pairs
+
+                summary.cp_added          += len(ok_pairs)
+                summary.cp_partial_failed += len(failed_items)
+                summary.cp_silently_dropped += len(silently_dropped)
+
+                successful_pairs = ok_pairs
+
+                # Partial failures
                 for fi in failed_items[:5]:
                     log.warning("Batch %d partial failure: %s [%s] status=%s",
                                 batch_num, fi.get("indicator_value"),
                                 fi.get("indicator_type"), fi.get("status"))
+                for fi in failed_items:
                     summary.cp_add_errors.append(
                         f"Batch {batch_num} status={fi.get('status')} "
                         f"type={fi.get('indicator_type')} "
                         f"value={fi.get('indicator_value')}"
                     )
+                    if uncreated_collection is not None:
+                        pair = (fi.get("indicator_type"),
+                                fi.get("indicator_value"))
+                        raw = raw_by_pair.get(pair)
+                        if raw is not None:
+                            uncreated_collection.append(_make_uncreated_entry(
+                                _strip_annotations(raw),
+                                "injection_partial_failed",
+                                f"Check Point returned status "
+                                f"{fi.get('status')} for this indicator",
+                                cp_type=fi.get("indicator_type"),
+                            ))
 
-            # Update state for successful items
+                # Silent drops
+                if silently_dropped:
+                    log.warning("Batch %d: %d indicators sent but not "
+                                "acknowledged in CP response (silently dropped)",
+                                batch_num, len(silently_dropped))
+                for pair in silently_dropped:
+                    log.debug("  silently_dropped: %s [%s]", pair[1], pair[0])
+                    if uncreated_collection is not None:
+                        raw = raw_by_pair.get(pair)
+                        if raw is not None:
+                            uncreated_collection.append(_make_uncreated_entry(
+                                _strip_annotations(raw),
+                                "injection_silently_dropped",
+                                "Sent to Check Point in this batch but not "
+                                "present in the response (likely deduped or "
+                                "dropped server-side)",
+                                cp_type=pair[0],
+                            ))
+
+            # Update state for successful (type, value) pairs
             for ind in batch:
                 pair = (ind["indicator_type"], ind["indicator_value"])
                 if pair not in successful_pairs:
@@ -1470,10 +1612,31 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
             summary.cp_add_errors.append(err)
             log.error(err)
 
+            # Mark every pair in this batch as batch-failed
+            if uncreated_collection is not None:
+                for pair in all_pairs:
+                    raw = raw_by_pair.get(pair)
+                    if raw is not None:
+                        uncreated_collection.append(_make_uncreated_entry(
+                            _strip_annotations(raw),
+                            "injection_batch_failed",
+                            f"Batch {batch_num} failed: {type(e).__name__}: {e}",
+                            cp_type=pair[0],
+                        ))
+
         time.sleep(cfg["api"]["rate_limit_delay_seconds"])
 
-    log.info("Injection complete: %d upserted, %d partial-failed, %d batch-failed",
-             summary.cp_added, summary.cp_partial_failed, summary.cp_failed_add)
+    log.info("Injection complete: %d upserted, %d partial-failed, "
+             "%d silently-dropped, %d batch-failed",
+             summary.cp_added, summary.cp_partial_failed,
+             summary.cp_silently_dropped, summary.cp_failed_add)
+
+
+def _strip_annotations(raw):
+    """Return a copy of a Defender indicator with our internal _cp_* fields removed."""
+    if not isinstance(raw, dict):
+        return raw
+    return {k: v for k, v in raw.items() if not k.startswith("_cp_")}
 
 
 # ============================================================
@@ -1505,7 +1668,6 @@ def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
                  "nothing to clean up.")
         return
 
-    # Build a set of composite keys (type:value) from the current Defender set
     defender_keys = set()
     for d in supported_indicators:
         v = d.get("_cp_value") or d.get("indicatorValue")
@@ -1562,7 +1724,6 @@ def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
                  "in %d batch(es) (~%.1fs at 50 rpm)",
                  len(stale), summary.cp_feed_name, num_batches, est_seconds)
 
-        # Breakdown by type for at-a-glance visibility
         by_type = {}
         for s in stale:
             by_type[s["indicator_type"]] = by_type.get(s["indicator_type"], 0) + 1
@@ -1603,33 +1764,29 @@ def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
 
         try:
             resp = cp_client.delete_indicators_batch(feed_id, batch)
-            ok, failed_count, failed_items = \
-                CheckPointIOCClient._summarize_indicators_response(resp)
+            parsed = CheckPointIOCClient._parse_indicators_response(resp)
 
             all_pairs = {(b["indicator_type"], b["indicator_value"])
                          for b in batch}
 
-            if ok is None:
+            if not parsed["parseable"]:
                 summary.cp_deleted += len(batch)
                 deleted_pairs = all_pairs
             else:
-                summary.cp_deleted += ok
-                summary.cp_failed_delete += failed_count
-                failed_pairs = {(fi.get("indicator_type"),
-                                 fi.get("indicator_value"))
-                                for fi in (failed_items or [])}
-                deleted_pairs = all_pairs - failed_pairs
-                for fi in failed_items[:5]:
+                summary.cp_deleted        += len(parsed["ok_pairs"])
+                summary.cp_failed_delete  += len(parsed["failed_items"])
+                deleted_pairs = parsed["ok_pairs"]
+                for fi in parsed["failed_items"][:5]:
                     log.warning("Delete batch %d partial failure: %s [%s] status=%s",
                                 batch_num, fi.get("indicator_value"),
                                 fi.get("indicator_type"), fi.get("status"))
+                for fi in parsed["failed_items"]:
                     summary.cp_delete_errors.append(
                         f"Batch {batch_num} status={fi.get('status')} "
                         f"type={fi.get('indicator_type')} "
                         f"value={fi.get('indicator_value')}"
                     )
 
-            # Remove successful (type, value) pairs from state
             for (itype, ivalue) in deleted_pairs:
                 key = _state_key(itype, ivalue)
                 previously_sent.pop(key, None)
@@ -1768,6 +1925,11 @@ def main():
     if not args.input_file:
         token_manager = TokenManager(session, cfg)
 
+    # Global accumulator for IOCs that don't make it into CP.
+    # Populated by the filter (rejects) and by inject_into_checkpoint()
+    # (batch/partial/silent failures).
+    uncreated = []
+
     exit_code = 0
     try:
         if args.input_file:
@@ -1789,9 +1951,9 @@ def main():
         export_csv(indicators, paths["csv"])
         log_summary(indicators, summary)
 
-        # Filter to all supported CP types (ipv4, domain, url, md5, sha1, sha256)
         supported_indicators = filter_supported_indicators(
-            indicators, cfg["checkpoint"], summary
+            indicators, cfg["checkpoint"], summary,
+            uncreated_collection=uncreated,
         )
 
         if args.skip_checkpoint:
@@ -1820,7 +1982,8 @@ def main():
             inject_into_checkpoint(
                 session, cfg, supported_indicators, summary,
                 test_mode=args.test, cp_client=cp_client,
-                state=state, state_path=state_path
+                state=state, state_path=state_path,
+                uncreated_collection=uncreated,
             )
 
             cleanup_stale_from_checkpoint(
@@ -1839,6 +2002,21 @@ def main():
         log.exception("Unexpected fatal error: %s", type(e).__name__)
         exit_code = 1
     finally:
+        # Finalize uncreated stats (authoritative from the list itself)
+        by_reason = {r: 0 for r in _UNCREATED_REASONS}
+        for item in uncreated:
+            r = item.get("_uncreated_reason", "unknown")
+            by_reason[r] = by_reason.get(r, 0) + 1
+        summary.uncreated_total = len(uncreated)
+        summary.uncreated_by_reason = by_reason
+
+        # Always write the uncreated report (even in test mode / even if empty)
+        try:
+            uncreated_path = write_uncreated_report(uncreated, summary, cfg)
+            summary.uncreated_report_path = uncreated_path
+        except Exception as e:
+            log.error("Failed to write uncreated report: %s", e)
+
         summary.finalize()
         summary.log_report()
         try:
