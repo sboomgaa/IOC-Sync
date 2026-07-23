@@ -2,11 +2,6 @@
 # Defender XDR → Check Point IOC Management
 # Configuration File (POC mode — inline secrets)
 # ============================================================
-# Before production:
-#   - chmod 600 config.yaml
-#   - Never commit to source control (.gitignore it)
-#   - Migrate secrets to Azure Key Vault or Managed Identity
-# ============================================================
 
 # ---------- Microsoft Defender XDR (Entra ID app) ----------
 azure:
@@ -21,7 +16,6 @@ api:
   scope: "https://api.securitycenter.microsoft.com/.default"
   request_timeout_seconds: 60
   # Check Point IOC API rate limit is 50 requests/minute per Swagger.
-  # 60/50 = 1.2s minimum between requests.
   rate_limit_delay_seconds: 1.2
 
 # ---------- Check Point IOC Management ----------
@@ -42,20 +36,32 @@ checkpoint:
   batch_size: 100
   default_severity: "High"          # "Low"|"Medium"|"High"|"Critical" or 0..100
   default_confidence: "High"        # "Low"|"Medium"|"High"            or 0..100
-  expiration_days: 30               # maps to ttl_in_days (1..100000)
+  expiration_days: 30
 
-  # Ask for verbose feed metadata (includes total_indicators, etc.)
   verbose_feeds: true
 
-  # Which IOC types to sync into Check Point.
-  # Set any to false to skip that entire type.
   supported_types:
-    ipv4:   true    # Defender IpAddress   → CP ipv4 (IPv6 always skipped)
-    domain: true    # Defender DomainName  → CP domain
-    url:    true    # Defender Url         → CP url
-    md5:    true    # Defender FileMd5     → CP md5
-    sha1:   true    # Defender FileSha1    → CP sha1
-    sha256: true    # Defender FileSha256  → CP sha256
+    ipv4:   true
+    domain: true
+    url:    true
+    md5:    true
+    sha1:   true
+    sha256: true
+
+  # -------- Shadow filter --------
+  # Check Point silently absorbs certain subdomains into a parent-domain
+  # record — confirmed for 'www.' subdomains. When both 'foo.com' and
+  # 'www.foo.com' are pushed to the same feed, the 'www.' entry never
+  # appears as a separate indicator; CP treats it as covered by 'foo.com'.
+  #
+  # This filter skips subdomains matching any listed prefix IF the
+  # corresponding parent domain is also being sent (in this batch) or is
+  # already tracked in state. Other subdomains (mail.foo.com, api.foo.com,
+  # etc.) are NOT skipped — they are added independently.
+  shadowing:
+    enabled: true
+    prefixes:
+      - "www."
 
   cleanup:
     enabled: false
@@ -70,9 +76,9 @@ output:
   csv_prefix: "defender_threat_indicators"
   txt_prefix: "defender_threat_indicators"
   summary_prefix: "run_summary"
-  uncreated_prefix: "uncreated_indicators"     # NEW: audit report of IOCs not in CP
+  uncreated_prefix: "uncreated_indicators"
   state_file: "cp_ioc_state.json"
 
 logging:
-  level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
-  debug_http: true                  # include full HTTP error bodies in logs
+  level: "INFO"
+  debug_http: true
