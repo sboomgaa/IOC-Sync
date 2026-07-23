@@ -10,9 +10,9 @@ POST /feeds/{feed_id}/indicators/delete (batched).
 Aligned to Check Point Custom IOC Management API v1.0.3.
 
 Any Defender IOC that does NOT successfully land in Check Point (filtered
-out, rejected, batch-failed, partial-failed, or silently dropped by the CP
-API) is captured to an audit report with the raw Defender JSON so nothing
-disappears silently.
+out, rejected, shadowed by a parent domain, batch-failed, partial-failed,
+or silently dropped by the CP API) is captured to an audit report with
+the raw Defender JSON so nothing disappears silently.
 
 Usage:
     python defender_ioc_export.py                    # normal run
@@ -124,20 +124,12 @@ def load_config(path="config.yaml"):
 # ============================================================
 # UNCREATED IOC TRACKING
 # ============================================================
-# Any Defender IOC that does NOT successfully land in Check Point ends up
-# here, with its raw JSON preserved plus a reason/detail annotation.
-# Reasons used:
-#   filter_unmapped_type      - Defender type has no CP equivalent
-#   filter_type_disabled      - CP type is disabled in config
-#   filter_bad_value          - Value failed per-type validation
-#   injection_batch_failed    - Entire PUT batch threw an exception
-#   injection_partial_failed  - CP returned non-2xx status for this item
-#   injection_silently_dropped- Sent to CP but not present in response
 
 _UNCREATED_REASONS = (
     "filter_unmapped_type",
     "filter_type_disabled",
     "filter_bad_value",
+    "filter_shadowed_by_parent",
     "injection_batch_failed",
     "injection_partial_failed",
     "injection_silently_dropped",
@@ -176,6 +168,10 @@ class RunSummary:
         self.by_type_bad_value = {}
         self.by_type_disabled = {}
         self.by_type_unmapped = {}
+
+        # Shadow filter results
+        self.shadow_filter_enabled = False
+        self.shadow_filter_skipped = 0
 
         self.cp_feed_name = None
         self.cp_feed_id = None
@@ -227,6 +223,10 @@ class RunSummary:
                 "by_type_bad_value": self.by_type_bad_value,
                 "by_type_disabled":  self.by_type_disabled,
                 "by_type_unmapped":  self.by_type_unmapped,
+            },
+            "shadow_filter": {
+                "enabled": self.shadow_filter_enabled,
+                "skipped": self.shadow_filter_skipped,
             },
             "checkpoint_injection": {
                 "feed_name":         self.cp_feed_name,
@@ -280,6 +280,10 @@ class RunSummary:
         if self.by_type_unmapped:
             log.info("Unmapped Defender types:  %s", self.by_type_unmapped)
         log.info("")
+        log.info("--- Shadow Filter (subdomain absorbed by parent) ---")
+        log.info("Enabled:                  %s", self.shadow_filter_enabled)
+        log.info("Skipped subdomains:       %d", self.shadow_filter_skipped)
+        log.info("")
         log.info("--- Check Point Injection ---")
         log.info("Feed:                     %s (id=%s)",
                  self.cp_feed_name, self.cp_feed_id)
@@ -317,18 +321,12 @@ def write_summary_report(summary: RunSummary, cfg: dict) -> Path:
 
 
 def write_uncreated_report(uncreated, summary, cfg) -> Path:
-    """
-    Persist the audit list of IOCs pulled from Defender but not created
-    in Check Point. Always written (even if empty) so downstream jobs can
-    depend on the file existing.
-    """
     out_dir = Path(cfg["output"]["directory"])
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = summary.started_at.strftime("%Y%m%dT%H%M%SZ")
     prefix = cfg["output"].get("uncreated_prefix", "uncreated_indicators")
     path = out_dir / f"{prefix}_{ts}.json"
 
-    # Recompute counts by reason from the actual list (source of truth)
     by_reason = {r: 0 for r in _UNCREATED_REASONS}
     for item in uncreated:
         r = item.get("_uncreated_reason", "unknown")
@@ -355,6 +353,10 @@ def write_uncreated_report(uncreated, summary, cfg) -> Path:
                 "The mapped Check Point type is disabled in config.yaml",
             "filter_bad_value":
                 "Value failed per-type validation (e.g. bad domain, non-hex hash)",
+            "filter_shadowed_by_parent":
+                "Subdomain (with a shadowing prefix like 'www.') was skipped "
+                "because its parent domain is already being sent — Check Point "
+                "would absorb the subdomain into the parent record",
             "injection_batch_failed":
                 "The PUT batch containing this IOC threw an HTTP/network error",
             "injection_partial_failed":
@@ -375,7 +377,7 @@ def write_uncreated_report(uncreated, summary, cfg) -> Path:
 
 
 # ============================================================
-# LOCAL STATE (tracks IOCs we've sent to Check Point)
+# LOCAL STATE
 # ============================================================
 
 def _state_key(cp_type, value):
@@ -383,7 +385,6 @@ def _state_key(cp_type, value):
 
 
 def _migrate_state_if_needed(state):
-    """Convert legacy state (bare value → entry) to composite key format."""
     known_types = {"ipv4", "domain", "url", "md5", "sha1", "sha256"}
     total_migrated = 0
 
@@ -872,10 +873,6 @@ def _canonicalize_value(cp_type, value):
 
 def filter_supported_indicators(indicators, cp_cfg, summary,
                                  uncreated_collection=None):
-    """
-    Filter Defender indicators. Also collects rejected raw JSON into
-    `uncreated_collection` if provided.
-    """
     supported_cfg = cp_cfg.get("supported_types", {}) or {}
     supported = []
 
@@ -949,8 +946,127 @@ def filter_supported_indicators(indicators, cp_cfg, summary,
 
 
 # ============================================================
+# SHADOW FILTER (subdomain absorbed by parent)
+# ============================================================
+#
+# Check Point IOC Management treats certain parent-domain indicators as
+# covering their subdomains. In our environment we've confirmed that
+# 'www.' subdomains are silently absorbed into the parent record.
+#
+# This filter skips a domain IOC if:
+#   - Its value starts with one of the configured shadowing prefixes
+#     (default: just "www.")
+#   - The corresponding parent domain (with the prefix stripped) is
+#     ALSO being sent in this batch or is already tracked in state
+#
+# All other subdomains (e.g. mail.foo.com, api.foo.com) pass through
+# untouched, since we've confirmed they are NOT absorbed by CP.
+#
+# Configurable via:
+#   checkpoint.shadowing.enabled  (default: true)
+#   checkpoint.shadowing.prefixes (default: ["www."])
+
+
+def detect_shadowed_domains(supported_indicators, feed_state, cp_cfg,
+                             summary, uncreated_collection=None):
+    """
+    Return a filtered list with shadowed-subdomain entries removed.
+    Populates the uncreated collection with the ones we skip.
+    """
+    shadow_cfg = cp_cfg.get("shadowing", {}) or {}
+    enabled = shadow_cfg.get("enabled", True)
+    prefixes = shadow_cfg.get("prefixes", ["www."]) or []
+
+    # Normalize prefixes: ensure lowercase and trailing dot
+    normalized_prefixes = []
+    for p in prefixes:
+        p = (p or "").strip().lower()
+        if not p:
+            continue
+        if not p.endswith("."):
+            p = p + "."
+        normalized_prefixes.append(p)
+
+    summary.shadow_filter_enabled = enabled
+
+    if not enabled or not normalized_prefixes:
+        log.info("Shadow filter disabled (enabled=%s, prefixes=%s)",
+                 enabled, normalized_prefixes)
+        return supported_indicators
+
+    log.info("Shadow filter active — prefixes: %s", normalized_prefixes)
+
+    # Build the set of parent domains that could shadow a subdomain.
+    # Two sources:
+    #   1. Domains currently in the supported batch
+    #   2. Domains already tracked in state for this feed
+    parent_domains = set()
+    for ind in supported_indicators:
+        if ind.get("_cp_type") == "domain":
+            parent_domains.add(ind["_cp_value"])
+
+    if feed_state:
+        for key in feed_state.get("indicators", {}).keys():
+            if isinstance(key, str) and key.startswith("domain:"):
+                parent_domains.add(key.split(":", 1)[1])
+
+    kept = []
+    skipped = 0
+
+    for ind in supported_indicators:
+        if ind.get("_cp_type") != "domain":
+            kept.append(ind)
+            continue
+
+        value = ind["_cp_value"]
+        matched_prefix = None
+        parent = None
+        for prefix in normalized_prefixes:
+            if value.startswith(prefix) and len(value) > len(prefix):
+                candidate_parent = value[len(prefix):]
+                if candidate_parent in parent_domains:
+                    matched_prefix = prefix
+                    parent = candidate_parent
+                    break
+
+        if matched_prefix:
+            skipped += 1
+            log.debug("Shadow-skip: %r absorbed by parent %r "
+                      "(prefix=%r)", value, parent, matched_prefix)
+            if uncreated_collection is not None:
+                uncreated_collection.append(_make_uncreated_entry(
+                    _strip_annotations(ind),
+                    "filter_shadowed_by_parent",
+                    f"Subdomain {value!r} skipped because prefix "
+                    f"{matched_prefix!r} was stripped and parent domain "
+                    f"{parent!r} is already being sent (Check Point would "
+                    f"absorb it into the parent record)",
+                    cp_type="domain",
+                ))
+        else:
+            kept.append(ind)
+
+    summary.shadow_filter_skipped = skipped
+    summary.total_supported = len(kept)
+
+    if skipped:
+        log.info("Shadow filter: skipped %d subdomain(s) whose parent is "
+                 "already being sent", skipped)
+    else:
+        log.info("Shadow filter: no shadowed subdomains found in this batch")
+
+    return kept
+
+
+def _strip_annotations(raw):
+    """Return a copy of a Defender indicator with internal _cp_* fields removed."""
+    if not isinstance(raw, dict):
+        return raw
+    return {k: v for k, v in raw.items() if not k.startswith("_cp_")}
+
+
+# ============================================================
 # CHECK POINT IOC MANAGEMENT CLIENT
-# Aligned to Custom IOC Management API v1.0.3
 # ============================================================
 
 class CheckPointIOCClient:
@@ -1082,8 +1198,6 @@ class CheckPointIOCClient:
                 return request_fn()
             raise
 
-    # ---------- feed discovery ----------
-
     def list_feeds(self, verbose=None):
         self._ensure_token()
 
@@ -1153,18 +1267,8 @@ class CheckPointIOCClient:
                   feed_name, [f.get("feed_name") for f in feeds])
         return None
 
-    # ---------- response parsing ----------
-
     @staticmethod
     def _parse_indicators_response(resp_json):
-        """
-        Parse an IndicatorsResponse into a structured breakdown.
-        Returns dict with:
-          - ok_pairs:      set of (type, value) that returned 2xx
-          - failed_items:  list of {status, indicator_type, indicator_value}
-          - ack_pairs:     set of ALL (type, value) present in the response
-          - parseable:     True if response had the expected shape
-        """
         result = {
             "ok_pairs": set(),
             "failed_items": [],
@@ -1200,8 +1304,6 @@ class CheckPointIOCClient:
                 })
         return result
 
-    # ---------- indicator upsert ----------
-
     def put_indicators(self, feed_id, indicators):
         self._ensure_token()
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
@@ -1228,8 +1330,6 @@ class CheckPointIOCClient:
             raise
 
         return response.json() if response.content else {}
-
-    # ---------- indicator batch deletion ----------
 
     def delete_indicators_batch(self, feed_id, indicator_pairs):
         self._ensure_token()
@@ -1263,8 +1363,6 @@ class CheckPointIOCClient:
             raise
 
         return response.json() if response.content else {}
-
-    # ---------- single indicator deletion (kept as fallback) ----------
 
     @staticmethod
     def _encode_indicator_value(indicator_type, indicator_value):
@@ -1309,7 +1407,7 @@ class CheckPointIOCClient:
 
 
 # ============================================================
-# INDICATOR TRANSFORMATION (Defender -> Check Point)
+# INDICATOR TRANSFORMATION
 # ============================================================
 
 SEVERITY_MAP = {
@@ -1418,14 +1516,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                             test_mode=False, cp_client=None,
                             state=None, state_path=None,
                             uncreated_collection=None):
-    """
-    Upsert supported indicators to Check Point.
-
-    Detects and reports (via uncreated_collection):
-      - Batch-level failures (entire PUT threw)
-      - Partial failures (CP returned non-2xx for individual items)
-      - Silent drops (sent to CP but not in the response)
-    """
     cp_cfg = cfg["checkpoint"]
 
     if not cp_cfg.get("enabled"):
@@ -1439,7 +1529,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
     feed_id = summary.cp_feed_id
     batch_size = int(cp_cfg.get("batch_size", 100))
 
-    # Build parallel lists so we can map (type, value) back to the raw Defender IOC
     cp_payloads = []
     raw_by_pair = {}
     for d in supported_indicators:
@@ -1458,7 +1547,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
              "previously-sent for this feed)",
              total, summary.cp_state_count)
 
-    # ---------- TEST MODE ----------
     if test_mode:
         est_seconds = num_batches * float(
             cfg["api"].get("rate_limit_delay_seconds", 1.2))
@@ -1501,7 +1589,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
         log.info("=" * 60)
         return
 
-    # ---------- REAL RUN ----------
     log.info("Upserting %d indicators in %d batch(es) of up to %d",
              total, num_batches, batch_size)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1515,7 +1602,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
         log.info("PUT batch %d/%d (%d indicators, %d unique pairs)",
                  batch_num, num_batches, len(batch), len(all_pairs))
 
-        # Detect intra-batch duplicates up front (info only)
         if len(batch) != len(all_pairs):
             dupes_in_batch = len(batch) - len(all_pairs)
             log.warning("Batch %d contains %d intra-batch duplicate (type,value) pairs — "
@@ -1527,7 +1613,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
             parsed = CheckPointIOCClient._parse_indicators_response(resp)
 
             if not parsed["parseable"]:
-                # Non-standard response — best-effort assume success
                 summary.cp_added += len(all_pairs)
                 successful_pairs = all_pairs
                 log.warning("Batch %d: response shape unrecognized — "
@@ -1538,7 +1623,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                 failed_items  = parsed["failed_items"]
                 ack_pairs     = parsed["ack_pairs"]
 
-                # Silent drops = sent (unique) but not present in response
                 silently_dropped = all_pairs - ack_pairs
 
                 summary.cp_added          += len(ok_pairs)
@@ -1547,7 +1631,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
 
                 successful_pairs = ok_pairs
 
-                # Partial failures
                 for fi in failed_items[:5]:
                     log.warning("Batch %d partial failure: %s [%s] status=%s",
                                 batch_num, fi.get("indicator_value"),
@@ -1571,7 +1654,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                                 cp_type=fi.get("indicator_type"),
                             ))
 
-                # Silent drops
                 if silently_dropped:
                     log.warning("Batch %d: %d indicators sent but not "
                                 "acknowledged in CP response (silently dropped)",
@@ -1590,7 +1672,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
                                 cp_type=pair[0],
                             ))
 
-            # Update state for successful (type, value) pairs
             for ind in batch:
                 pair = (ind["indicator_type"], ind["indicator_value"])
                 if pair not in successful_pairs:
@@ -1612,7 +1693,6 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
             summary.cp_add_errors.append(err)
             log.error(err)
 
-            # Mark every pair in this batch as batch-failed
             if uncreated_collection is not None:
                 for pair in all_pairs:
                     raw = raw_by_pair.get(pair)
@@ -1632,15 +1712,8 @@ def inject_into_checkpoint(session, cfg, supported_indicators, summary,
              summary.cp_silently_dropped, summary.cp_failed_add)
 
 
-def _strip_annotations(raw):
-    """Return a copy of a Defender indicator with our internal _cp_* fields removed."""
-    if not isinstance(raw, dict):
-        return raw
-    return {k: v for k, v in raw.items() if not k.startswith("_cp_")}
-
-
 # ============================================================
-# CHECK POINT CLEANUP (via POST /indicators/delete batch)
+# CHECK POINT CLEANUP
 # ============================================================
 
 def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
@@ -1711,7 +1784,6 @@ def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
     batch_size = int(cp_cfg.get("batch_size", 100))
     num_batches = (len(stale) + batch_size - 1) // batch_size
 
-    # ---------- TEST MODE ----------
     if test_mode:
         est_seconds = num_batches * float(
             cfg["api"].get("rate_limit_delay_seconds", 1.2))
@@ -1752,7 +1824,6 @@ def cleanup_stale_from_checkpoint(cfg, supported_indicators, summary,
         log.info("=" * 60)
         return
 
-    # ---------- REAL DELETE (batched) ----------
     log.info("Deleting %d stale indicators in %d batch(es) of up to %d",
              len(stale), num_batches, batch_size)
 
@@ -1925,9 +1996,6 @@ def main():
     if not args.input_file:
         token_manager = TokenManager(session, cfg)
 
-    # Global accumulator for IOCs that don't make it into CP.
-    # Populated by the filter (rejects) and by inject_into_checkpoint()
-    # (batch/partial/silent failures).
     uncreated = []
 
     exit_code = 0
@@ -1974,10 +2042,18 @@ def main():
             log.info("Resolved feed id=%s", feed_id)
 
             state, state_path = load_state(cfg)
+            feed_state = get_feed_state(state, feed_id)
             log.info("Local state loaded: %s "
                      "(tracked indicators for this feed: %d)",
-                     state_path,
-                     len(get_feed_state(state, feed_id)["indicators"]))
+                     state_path, len(feed_state["indicators"]))
+
+            # NEW: Filter shadowed subdomains (e.g. www.foo.com when
+            # foo.com is in the batch/state). Done AFTER state load so we
+            # can check against currently-tracked domains.
+            supported_indicators = detect_shadowed_domains(
+                supported_indicators, feed_state, cfg["checkpoint"],
+                summary, uncreated_collection=uncreated,
+            )
 
             inject_into_checkpoint(
                 session, cfg, supported_indicators, summary,
@@ -2002,7 +2078,6 @@ def main():
         log.exception("Unexpected fatal error: %s", type(e).__name__)
         exit_code = 1
     finally:
-        # Finalize uncreated stats (authoritative from the list itself)
         by_reason = {r: 0 for r in _UNCREATED_REASONS}
         for item in uncreated:
             r = item.get("_uncreated_reason", "unknown")
@@ -2010,7 +2085,6 @@ def main():
         summary.uncreated_total = len(uncreated)
         summary.uncreated_by_reason = by_reason
 
-        # Always write the uncreated report (even in test mode / even if empty)
         try:
             uncreated_path = write_uncreated_report(uncreated, summary, cfg)
             summary.uncreated_report_path = uncreated_path
