@@ -3,13 +3,11 @@
 # Configuration File (POC mode — inline secrets)
 # ============================================================
 
-# ---------- Microsoft Defender XDR (Entra ID app) ----------
 azure:
   tenant_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   client_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   client_secret: "your-defender-client-secret"
 
-# ---------- Defender API endpoints & runtime ----------
 api:
   token_url_template: "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
   indicator_url: "https://api.securitycenter.microsoft.com/api/indicators"
@@ -18,16 +16,11 @@ api:
   # Check Point IOC API rate limit is 50 requests/minute per Swagger.
   rate_limit_delay_seconds: 1.2
 
-# ---------- Check Point IOC Management ----------
-# Regional endpoints (pick your region):
-#   EU:  https://cloudinfra-gw.portal.checkpoint.com
-#   AU:  https://cloudinfra-gw.ap.portal.checkpoint.com
-#   CA:  https://cloudinfra-gw.ca.portal.checkpoint.com
-#   US:  https://cloudinfra-gw.us.portal.checkpoint.com
 checkpoint:
   enabled: true
-  auth_url: "https://cloudinfra-gw.portal.checkpoint.com"
-  api_base_url: "https://cloudinfra-gw.portal.checkpoint.com/app/ioc-management"
+  # Configured for the Canadian Portal - update if using a different geo
+  auth_url: "https://cloudinfra-gw.ca.portal.checkpoint.com"
+  api_base_url: "https://cloudinfra-gw.ca.portal.checkpoint.com/app/ioc-management"
   client_id: "your-checkpoint-client-id"
   access_key: "your-checkpoint-access-key"
 
@@ -36,7 +29,17 @@ checkpoint:
   batch_size: 100
   default_severity: "High"          # "Low"|"Medium"|"High"|"Critical" or 0..100
   default_confidence: "High"        # "Low"|"Medium"|"High"            or 0..100
-  expiration_days: 30
+
+  # Expiration handling:
+  #   preserve_defender_expiration: true (default)
+  #     -> ttl_in_days is computed from each IOC's Defender expirationTime
+  #        so Check Point expires it on the same date Defender intends.
+  #   preserve_defender_expiration: false
+  #     -> every IOC uses the fixed expiration_days value below.
+  # expiration_days is ALSO the fallback when Defender has no expiration,
+  # the value is unparseable, or it is already in the past.
+  preserve_defender_expiration: true
+  expiration_days: 30               # maps to ttl_in_days (1..100000)
 
   verbose_feeds: true
 
@@ -48,16 +51,8 @@ checkpoint:
     sha1:   true
     sha256: true
 
-  # -------- Shadow filter --------
-  # Check Point silently absorbs certain subdomains into a parent-domain
-  # record — confirmed for 'www.' subdomains. When both 'foo.com' and
-  # 'www.foo.com' are pushed to the same feed, the 'www.' entry never
-  # appears as a separate indicator; CP treats it as covered by 'foo.com'.
-  #
-  # This filter skips subdomains matching any listed prefix IF the
-  # corresponding parent domain is also being sent (in this batch) or is
-  # already tracked in state. Other subdomains (mail.foo.com, api.foo.com,
-  # etc.) are NOT skipped — they are added independently.
+  # Shadow filter: skip subdomains whose parent is being sent, since CP
+  # absorbs certain subdomain patterns into their parent record.
   shadowing:
     enabled: true
     prefixes:
