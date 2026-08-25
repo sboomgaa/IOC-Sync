@@ -54,7 +54,7 @@ Defender is the source of truth; the Check Point feed is the replica.
   - Required app permission: `Ti.ReadWrite.All` (WindowsDefenderATP family).
 - **Read indicators:** `GET https://api.securitycenter.microsoft.com/api/indicators`
   - OData pagination via `@odata.nextLink`.
-  - Optional server-side filter `$filter=expirationTime gt {now}`.
+  - Optional server-side filter `$filter=(expirationTime eq null or expirationTime gt {now})`.
 
 ### 3.2 Check Point Custom IOC Management (v1.0.3)
 Base URL is regional, e.g. `https://cloudinfra-gw.{region}.portal.checkpoint.com/app/ioc-management`.
@@ -284,7 +284,8 @@ function main(args):
 ```
 function get_all_indicators(session, token_mgr, cfg):
     url = cfg.api.indicator_url
-    params = {$filter: expirationTime gt NOW} if cfg.filters.exclude_expired
+    params = {$filter: (expirationTime eq null or expirationTime gt NOW)}
+             if cfg.filters.exclude_expired
     indicators = [], raw_pages = []
     page = 1
     while url:
@@ -368,6 +369,8 @@ function compute_ttl_in_days(indicator, cfg, now):
     if not cfg.preserve_defender_expiration:
         return default, "default"
 
+    if indicator.expirationTime is missing or blank:
+        return none, "no-expiration"             # omit ttl_in_days in CP
     exp = parse_iso(indicator.expirationTime)      # strip sub-seconds, 'Z'->+00:00
     if exp is none:
         return default, "default"
@@ -390,7 +393,8 @@ function defender_to_cp_indicator(d, cfg, summary, now):
     return {
         indicator_type:  d._cp_type,
         indicator_value: d._cp_value,
-        severity, confidence, ttl_in_days: ttl,
+        severity, confidence,
+        [ttl_in_days: ttl only when ttl is not none],
         name: sanitize_name("MSDefender_" + type + "_" + value),
         enabled: true,
         description: sanitize_desc(d.description or d.title or default),

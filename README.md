@@ -309,10 +309,15 @@ ttl_in_days = ceil( (expirationTime − now) / 1 day )
 
 so the IOC expires in Check Point on the same date Defender intends.
 
-**Fallback to `expiration_days`** occurs when:
-- Defender provides no expiration, or
-- the value is unparseable, or
-- the expiration is already in the past.
+Indicators are selected when `expirationTime` is either **in the future** or
+**not set**. Expired indicators are excluded by the Defender API filter.
+
+When Defender provides no expiration, the Check Point payload omits
+`ttl_in_days`, so the synchronized IOC also has no expiration.
+
+**Fallback to `expiration_days`** occurs only when expiration preservation is
+disabled, or an explicitly supplied expiration is unparseable/already expired
+(for example, in an offline input file).
 
 > **Because `ttl_in_days` is relative to creation time, it is re-anchored
 > on every sync.** As long as the job runs regularly, Check Point's

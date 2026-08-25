@@ -172,6 +172,7 @@ class RunSummary:
 
         # TTL / expiration accounting
         self.ttl_from_defender = 0
+        self.ttl_no_expiration = 0
         self.ttl_from_default = 0
         self.ttl_from_expired_fallback = 0
 
@@ -234,6 +235,7 @@ class RunSummary:
             },
             "ttl": {
                 "from_defender_expiration": self.ttl_from_defender,
+                "no_expiration":            self.ttl_no_expiration,
                 "from_config_default":      self.ttl_from_default,
                 "from_expired_fallback":    self.ttl_from_expired_fallback,
             },
@@ -297,6 +299,7 @@ class RunSummary:
         log.info("")
         log.info("--- TTL / Expiration ---")
         log.info("From Defender expiration: %d", self.ttl_from_defender)
+        log.info("No expiration:             %d", self.ttl_no_expiration)
         log.info("From config default:      %d", self.ttl_from_default)
         log.info("From expired-fallback:    %d", self.ttl_from_expired_fallback)
         log.info("")
@@ -556,8 +559,11 @@ def get_all_indicators(session, token_manager, cfg):
     params = None
     if filters.get("exclude_expired"):
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        params = {"$filter": f"expirationTime gt {now_iso}"}
-        log.info("Filtering: excluding indicators expired before %s", now_iso)
+        params = {
+            "$filter": f"(expirationTime eq null or expirationTime gt {now_iso})"
+        }
+        log.info("Filtering: including indicators with no expiration or "
+                 "expiration after %s", now_iso)
 
     page_number = 1
     while url:
@@ -952,44 +958,33 @@ def _parse_defender_expiration(expiration_str):
 
 
 def compute_ttl_in_days(defender_indicator, cp_cfg, now=None):
+    """Return Check Point TTL and its accounting source.
+
+    Missing/blank expirationTime means permanent: return None so the
+    Check Point payload omits ttl_in_days.
     """
-    Determine ttl_in_days to send to Check Point.
+    raw_expiration = defender_indicator.get("expirationTime")
+    if raw_expiration is None or (
+            isinstance(raw_expiration, str) and not raw_expiration.strip()):
+        return None, "no-expiration"
 
-    Precedence:
-      1. Defender expirationTime (if present, parseable, and in the future)
-      2. Config default (checkpoint.expiration_days)
-      3. Hardcoded fallback of 30
-
-    Returns (ttl_days:int, source:str) where source is one of:
-      'defender' | 'default' | 'expired-fallback'
-
-    ttl is always clamped to the CP-permitted range [1, 100000].
-    """
-    preserve = bool(cp_cfg.get("preserve_defender_expiration", True))
     default_days = _clamp(int(cp_cfg.get("expiration_days", 30)), 1, 100000)
-
-    if not preserve:
+    if not bool(cp_cfg.get("preserve_defender_expiration", True)):
         return default_days, "default"
 
-    exp_dt = _parse_defender_expiration(
-        defender_indicator.get("expirationTime"))
+    exp_dt = _parse_defender_expiration(raw_expiration)
     if exp_dt is None:
+        log.warning("Unparseable expirationTime %r; using configured TTL",
+                    raw_expiration)
         return default_days, "default"
 
-    if now is None:
-        now = datetime.now(timezone.utc)
-    now = now.replace(microsecond=0)   # match exp_dt precision
-
+    now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     delta_seconds = (exp_dt - now).total_seconds()
     if delta_seconds <= 0:
-        # Already expired in Defender — fall back to default (still upsert)
         return default_days, "expired-fallback"
 
-    # Round UP so a partial final day is never truncated to zero and the
-    # CP expiration date lands on (or just after) Defender's date.
     ttl_days = int(math.ceil(delta_seconds / 86400.0))
-    ttl_days = _clamp(ttl_days, 1, 100000)
-    return ttl_days, "defender"
+    return _clamp(ttl_days, 1, 100000), "defender"
 
 
 # ============================================================
@@ -1607,12 +1602,14 @@ def defender_to_cp_indicator(d, cp_cfg, summary=None, now=None):
     if summary is not None:
         if ttl_source == "defender":
             summary.ttl_from_defender += 1
+        elif ttl_source == "no-expiration":
+            summary.ttl_no_expiration += 1
         elif ttl_source == "expired-fallback":
             summary.ttl_from_expired_fallback += 1
         else:
             summary.ttl_from_default += 1
 
-    log.debug("IOC %s [%s]: ttl_in_days=%d (source=%s, defender_exp=%r)",
+    log.debug("IOC %s [%s]: ttl_in_days=%r (source=%s, defender_exp=%r)",
               value, cp_type, ttl, ttl_source, d.get("expirationTime"))
 
     description = sanitize_description(
@@ -1621,17 +1618,19 @@ def defender_to_cp_indicator(d, cp_cfg, summary=None, now=None):
     )
     name = _make_cp_indicator_name(cp_type, value)
 
-    return {
+    payload = {
         "indicator_type":  cp_type,
         "indicator_value": value,
         "severity":        severity,
         "confidence":      confidence,
-        "ttl_in_days":     ttl,
         "name":            name,
         "enabled":         True,
         "description":     description,
         "info":            INFO_MARKER,
     }
+    if ttl is not None:
+        payload["ttl_in_days"] = ttl
+    return payload
 
 
 # ============================================================
