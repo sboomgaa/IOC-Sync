@@ -1,0 +1,13 @@
+services:
+  ioc-sync:
+    image: ioc-sync:latest
+    container_name: ioc-sync
+
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./exports:/app/exports
+
+    environment:
+      DEFENDER_CLIENT_SECRET: ${DEFENDER_CLIENT_SECRET}
+
+    restart: "no"
