@@ -1,0 +1,10 @@
+.git
+.gitignore
+
+exports/
+config.yaml
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
