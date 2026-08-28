@@ -107,7 +107,17 @@ def log_http_error(context, response, debug_http=True,
 # ============================================================
 
 def load_config(path="config.yaml"):
-    with open(path, "r", encoding="utf-8") as f:
+
+    config_path = Path(path)
+    # Resolve relative paths from the script directory
+    # so cron/systemd/container executions work reliably.
+    if not config_path.is_absolute():
+        script_dir = Path(__file__).resolve().parent
+        config_path = script_dir / config_path
+    
+    log.info("Loading configuration from: %s", config_path)
+
+    with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     env_secret = os.environ.get("DEFENDER_CLIENT_SECRET")
