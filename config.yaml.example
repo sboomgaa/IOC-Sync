@@ -18,7 +18,7 @@ api:
 
 checkpoint:
   enabled: true
-  current_list_url: "https://custom-ioc-enforcement.iaas.checkpoint.com/public/blend/xxxxxxxx.csv"
+  current_feed_url: "https://custom-ioc-enforcement.iaas.checkpoint.com/public/blend/xxxxxxxx.csv"
   current_list_timeout_seconds: 60
 
   # Configured for the Canadian Portal - update if using a different geo
