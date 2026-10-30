@@ -36,6 +36,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 import yaml
@@ -869,11 +870,15 @@ def is_valid_domain(v):
     return bool(_DOMAIN_RE.match(v))
 
 
-def is_valid_url(v):
+def is_valid_url(v, allow_schemeless=False):
     v = (v or "").strip()
-    if not v:
-        return False
-    return bool(_URL_RE.match(v))
+    if not v or any(ch.isspace() for ch in v): return False
+    if _URL_RE.match(v): return bool(urlsplit(v).hostname)
+    if not allow_schemeless: return False
+    parsed = urlsplit("//" + v); host = parsed.hostname
+    if not host: return False
+    try: ipaddress.ip_address(host); return True
+    except ValueError: return is_valid_domain(host)
 
 
 def is_valid_hash(v, kind):
@@ -889,13 +894,19 @@ def is_valid_hash(v, kind):
     return False
 
 
-def validate_indicator_value(cp_type, value):
+CP_TYPE_ALIASES = {"ip":"ipv4", "ipv4":"ipv4", "domain":"domain", "url":"url", "md5":"md5", "sha1":"sha1", "sha256":"sha256"}
+def _canonicalize_cp_type(cp_type):
+    normalized = (cp_type or "").strip().lower()
+    return CP_TYPE_ALIASES.get(normalized, normalized)
+
+def validate_indicator_value(cp_type, value, allow_schemeless_url=False):
+    cp_type = _canonicalize_cp_type(cp_type)
     if cp_type == "ipv4":
         return is_valid_ipv4(value)
     if cp_type == "domain":
         return is_valid_domain(value)
     if cp_type == "url":
-        return is_valid_url(value)
+        return is_valid_url(value, allow_schemeless=allow_schemeless_url)
     if cp_type in ("md5", "sha1", "sha256"):
         return is_valid_hash(value, cp_type)
     return False
@@ -903,6 +914,7 @@ def validate_indicator_value(cp_type, value):
 
 def _canonicalize_value(cp_type, value):
     """Normalize the value the way Check Point stores it."""
+    cp_type = _canonicalize_cp_type(cp_type)
     v = (value or "").strip()
     if not v:
         return v
@@ -916,7 +928,7 @@ def _canonicalize_value(cp_type, value):
     if cp_type in ("md5", "sha1", "sha256"):
         return v.lower()
 
-    if cp_type == "ipv4":
+    if cp_type in ("ip", "ipv4"):
         try:
             parts = v.split(".")
             if len(parts) == 4 and all(p.isdigit() for p in parts):
@@ -1360,6 +1372,7 @@ class CheckPointIOCClient:
                 if f.get("feed_type") != "MANUAL":
                     log.warning("Feed %r has feed_type=%s (expected MANUAL).",
                                 feed_name, f.get("feed_type"))
+                self.matched_feed = dict(f)
                 log.info("Matched feed %r -> feed_id=%s", feed_name, fid)
                 return fid
 
@@ -1449,11 +1462,9 @@ class CheckPointIOCClient:
         url = (f"{self.cp_cfg['api_base_url'].rstrip('/')}"
                f"/feeds/{feed_id}/indicators/delete")
 
-        payload = [
-            {"indicator_type": p["indicator_type"],
-             "indicator_value": p["indicator_value"]}
-            for p in indicator_pairs
-        ]
+        payload = [{"indicator_type": _canonicalize_cp_type(p["indicator_type"]),
+                    "indicator_value": _canonicalize_value(_canonicalize_cp_type(p["indicator_type"]), p["indicator_value"])}
+                   for p in indicator_pairs]
 
         response_holder = {}
         def _do():
@@ -2122,6 +2133,287 @@ def log_summary(indicators, summary):
     log.info("Breakdown by severity: %s", by_sev)
 
 
+
+# ============================================================
+# CHECK POINT FEED SNAPSHOT + RECONCILIATION PLAN
+# ============================================================
+FEED_COLUMN_ALIASES = {
+    "indicator_type": ("indicator_type", "type", "ioc_type", "indicator type"),
+    "indicator_value": ("indicator_value", "value", "ioc", "indicator", "indicator value"),
+    "severity": ("severity",),
+    "confidence": ("confidence",),
+    "ttl_in_days": ("ttl_in_days", "ttl", "ttl days"),
+    "name": ("name",),
+    "enabled": ("enabled", "active"),
+    "description": ("description", "desc"),
+    "info": ("info",),
+}
+
+def _canonical_header(value):
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+
+def _feed_header_map(fieldnames):
+    aliases = {}
+    for canonical, names in FEED_COLUMN_ALIASES.items():
+        for name in names:
+            aliases[_canonical_header(name)] = canonical
+    return {raw: aliases.get(_canonical_header(raw)) for raw in (fieldnames or [])}
+
+def _coerce_feed_scalar(field, value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+    if field in ("severity", "confidence", "ttl_in_days"):
+        try:
+            return int(float(value))
+        except ValueError:
+            return value
+    if field == "enabled":
+        return value.lower() in ("1", "true", "yes", "y", "on", "enabled")
+    return value
+
+def pull_current_checkpoint_feed(session, cfg):
+    cp_cfg = cfg["checkpoint"]
+    url = cp_cfg.get("current_feed_url") or cp_cfg.get("feed_url")
+    if not url:
+        raise ValueError("checkpoint.current_feed_url is required for snapshot-based reconciliation")
+    timeout = cfg["api"].get("request_timeout_seconds", 60)
+    verify = bool(cp_cfg.get("feed_tls_verify", True))
+    headers = {"Accept": "text/csv, application/csv, text/plain, */*"}
+    token = cp_cfg.get("feed_bearer_token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    log.info("Pulling current Check Point feed snapshot: %s", url)
+    response = session.get(url, headers=headers, timeout=timeout, verify=verify)
+    response.raise_for_status()
+    text = response.text.lstrip("\ufeff")
+    if not text.strip():
+        log.warning("Check Point feed snapshot is empty")
+        return [], {"url": url, "rows": 0, "content_type": response.headers.get("Content-Type")}
+    sample = text[:8192]
+    dialect, _ = _sniff_csv_dialect(sample)
+    reader = csv.DictReader(text.splitlines(), dialect=dialect)
+    header_map = _feed_header_map(reader.fieldnames)
+    if "indicator_value" not in header_map.values():
+        raise ValueError(f"Check Point feed has no recognizable indicator value column: {reader.fieldnames}")
+    records = []
+    skipped = 0
+    for row_number, row in enumerate(reader, start=2):
+        item = {}
+        for raw_name, raw_value in row.items():
+            canonical = header_map.get(raw_name)
+            if canonical:
+                item[canonical] = _coerce_feed_scalar(canonical, raw_value)
+        cp_type = _canonicalize_cp_type(item.get("indicator_type"))
+        value = item.get("indicator_value")
+        if not cp_type or not value:
+            skipped += 1
+            log.debug("Skipping feed row %d without type/value", row_number)
+            continue
+        value = _canonicalize_value(cp_type, value)
+        if not validate_indicator_value(cp_type, value, allow_schemeless_url=(cp_type == "url")):
+            skipped += 1
+            log.warning("Skipping invalid Check Point feed row %d: %s:%r", row_number, cp_type, value)
+            continue
+        item["indicator_type"] = cp_type
+        item["indicator_value"] = value
+        records.append(item)
+    metadata = {
+        "url": url,
+        "rows": len(records),
+        "skipped_rows": skipped,
+        "content_type": response.headers.get("Content-Type"),
+        "etag": response.headers.get("ETag"),
+        "last_modified": response.headers.get("Last-Modified"),
+    }
+    log.info("Current Check Point snapshot contains %d valid IOCs (%d skipped)", len(records), skipped)
+    return records, metadata
+
+def _url_identity(value):
+    value=(value or "").strip(); parsed=urlsplit(value if "://" in value else "//"+value)
+    host=(parsed.hostname or "").lower(); authority=host + ((":"+str(parsed.port)) if parsed.port is not None else "")
+    path="" if parsed.path == "/" else (parsed.path or "")
+    return urlunsplit(("",authority,path,parsed.query,parsed.fragment)).lstrip("//")
+def _pair(record):
+    cp_type=_canonicalize_cp_type(record["indicator_type"]); value=record["indicator_value"]
+    return (cp_type, _url_identity(value) if cp_type == "url" else value)
+
+def build_desired_checkpoint_records(supported_indicators, cp_cfg, summary):
+    now = datetime.now(timezone.utc)
+    desired = {}
+    duplicates = 0
+    raw_by_pair = {}
+    for source in supported_indicators:
+        payload = defender_to_cp_indicator(source, cp_cfg, summary=summary, now=now)
+        key = _pair(payload)
+        if key in desired:
+            duplicates += 1
+            continue
+        desired[key] = payload
+        raw_by_pair[key] = source
+    if duplicates:
+        log.info("Collapsed %d duplicate Defender IOC pair(s)", duplicates)
+    return desired, raw_by_pair
+
+def _comparable(record, fields):
+    result = {}
+    for field in fields:
+        if field not in record or record.get(field) is None:
+            continue
+        value = record.get(field)
+        if isinstance(value, str):
+            value = value.strip()
+        result[field] = value
+    return result
+
+def plan_checkpoint_changes(desired, observed_records, cp_cfg,
+                            managed_records=None):
+    """Build create/update/delete actions without deleting unowned rows.
+
+    observed_records are used to avoid recreating IOCs visible in the target.
+    managed_records are the durable identities successfully written by this
+    tool and are the only records eligible for deletion.
+    """
+    observed = {}
+    duplicate_current = []
+    for record in observed_records:
+        key = _pair(record)
+        if key in observed:
+            duplicate_current.append(record)
+            continue
+        observed[key] = record
+
+    managed = {}
+    for record in (managed_records or {}).values():
+        if isinstance(record, dict) and record.get("indicator_type") and record.get("indicator_value"):
+            managed[_pair(record)] = record
+
+    desired_keys = set(desired)
+    observed_keys = set(observed)
+    managed_keys = set(managed)
+    create_keys = sorted(desired_keys - observed_keys)
+    delete_keys = sorted(managed_keys - desired_keys)
+    common_keys = sorted(desired_keys & observed_keys)
+
+    configured_fields = cp_cfg.get("compare_fields", [])
+    updates, unchanged = [], []
+    for key in common_keys:
+        fields = [f for f in configured_fields
+                  if f in observed[key] and observed[key].get(f) is not None]
+        differences = {}
+        for field in fields:
+            before = _comparable(observed[key], [field]).get(field)
+            after = _comparable(desired[key], [field]).get(field)
+            if before != after:
+                differences[field] = {"current": before, "desired": after}
+        if differences:
+            updates.append({"key": key, "payload": desired[key],
+                            "differences": differences})
+        else:
+            unchanged.append(key)
+
+    return {
+        "create": [desired[k] for k in create_keys],
+        "update": updates,
+        "delete": [managed[k] for k in delete_keys],
+        "unchanged": unchanged,
+        "duplicate_current": duplicate_current,
+        "counts": {
+            "desired": len(desired),
+            "current": len(observed),
+            "managed": len(managed),
+            "create": len(create_keys),
+            "update": len(updates),
+            "delete": len(delete_keys),
+            "unchanged": len(unchanged),
+            "duplicate_current": len(duplicate_current),
+        },
+    }
+
+def load_managed_inventory(cfg, feed_id):
+    path=Path(cfg["output"]["directory"]) / cfg["output"].get("managed_inventory_file","cp_managed_inventory.json")
+    if not path.exists(): return {}, path
+    try:
+        data=json.loads(path.read_text(encoding="utf-8")); records=data.get("feeds",{}).get(feed_id,{}).get("indicators",{})
+        if not isinstance(records,dict): raise ValueError("indicators is not an object")
+        return records,path
+    except Exception as exc: raise RuntimeError(f"Managed inventory unreadable: {path}: {exc}") from exc
+def save_managed_inventory(records,path,feed_id):
+    data={"version":1,"feeds":{feed_id:{"indicators":records}}}; path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+".tmp"); tmp.write_text(json.dumps(data,indent=2),encoding="utf-8"); tmp.replace(path)
+def merge_snapshot_and_inventory(snapshot, inventory):
+    merged={}
+    for r in inventory.values():
+        if isinstance(r,dict) and r.get("indicator_type") and r.get("indicator_value"): merged[_pair(r)]=dict(r)
+    for r in snapshot: merged[_pair(r)]=dict(r)
+    return list(merged.values())
+def _inventory_key(record):
+    t,v=_pair(record); return f"{t}:{v}"
+
+def validate_change_plan(plan, cfg):
+    safety = cfg["checkpoint"].get("safety", {}) or {}
+    counts = plan["counts"]
+    changes = counts["create"] + counts["update"] + counts["delete"]
+    problems = []
+    if counts["desired"] == 0 and not safety.get("allow_empty_origin", False):
+        problems.append("origin produced zero desired IOCs")
+    max_delete = int(safety.get("max_delete_per_run", 500))
+    if counts["delete"] > max_delete:
+        problems.append(f"deletes {counts['delete']} exceed max_delete_per_run={max_delete}")
+    max_changes = int(safety.get("max_changes_per_run", 5000))
+    if changes > max_changes:
+        problems.append(f"changes {changes} exceed max_changes_per_run={max_changes}")
+    managed = counts.get("managed", counts["current"])
+    ratio = (counts["delete"] / managed) if managed else 0.0
+    max_ratio = float(safety.get("max_delete_ratio", 0.50))
+    if managed and ratio > max_ratio:
+        problems.append(f"delete ratio {ratio:.1%} exceeds max_delete_ratio={max_ratio:.1%}")
+    return problems
+
+def write_change_plan(plan, snapshot_meta, summary, cfg):
+    out_dir = Path(cfg["output"]["directory"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = summary.started_at.strftime("%Y%m%dT%H%M%SZ")
+    path = out_dir / f"checkpoint_change_plan_{ts}.json"
+    serializable = dict(plan)
+    serializable["unchanged"] = [{"indicator_type": k[0], "indicator_value": k[1]} for k in plan["unchanged"]]
+    serializable["update"] = [
+        {"indicator_type": item["key"][0], "indicator_value": item["key"][1],
+         "payload": item["payload"], "differences": item["differences"]}
+        for item in plan["update"]
+    ]
+    serializable["snapshot"] = snapshot_meta
+    serializable["generated_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Change plan written: %s", path)
+    return path
+
+def apply_change_plan(cp_client, feed_id, plan, cfg, summary, uncreated, raw_by_pair, inventory, inventory_path):
+    delay=float(cfg["api"].get("rate_limit_delay_seconds",1.2)); size=int(cfg["checkpoint"].get("batch_size",100))
+    deletes=plan["delete"]; upserts=plan["create"]+[u["payload"] for u in plan["update"]]
+    for start in range(0,len(deletes),size):
+        batch=deletes[start:start+size]
+        try:
+            cp_client.delete_indicators_batch(feed_id,batch); summary.cp_deleted += len(batch)
+            for r in batch: inventory.pop(_inventory_key(r),None)
+            save_managed_inventory(inventory,inventory_path,feed_id); log.info("Delete batch accepted: %d",len(batch))
+        except Exception as exc:
+            summary.cp_failed_delete += len(batch); summary.cp_delete_errors.append(str(exc)); raise
+        time.sleep(delay)
+    for start in range(0,len(upserts),size):
+        batch=upserts[start:start+size]; summary.cp_sent += len(batch)
+        try:
+            cp_client.put_indicators(feed_id,batch); summary.cp_added += len(batch); now=datetime.now(timezone.utc).isoformat()
+            for r in batch:
+                key=_inventory_key(r); old=inventory.get(key,{})
+                inventory[key]={"indicator_type":r["indicator_type"],"indicator_value":r["indicator_value"],"first_managed":old.get("first_managed",now),"last_confirmed":now}
+            save_managed_inventory(inventory,inventory_path,feed_id); log.info("Upsert batch accepted: %d",len(batch))
+        except Exception as exc:
+            summary.cp_failed_add += len(batch); raise
+        time.sleep(delay)
+
 # ============================================================
 # CLI
 # ============================================================
@@ -2154,132 +2446,100 @@ def parse_args():
 
 def main():
     args = parse_args()
-
     try:
         cfg = load_config(args.config)
     except Exception as e:
         print(f"[FATAL] Failed to load configuration: {e}", file=sys.stderr)
         return 2
-
     global log
     log = configure_logging(cfg.get("logging", {}).get("level", "INFO"))
-
     if args.cleanup:
-        cfg["checkpoint"].setdefault("cleanup", {})["enabled"] = True
+        log.warning("--cleanup is retained for compatibility; snapshot reconciliation always plans deletions")
     if args.no_cleanup:
-        cfg["checkpoint"].setdefault("cleanup", {})["enabled"] = False
-
-    if args.test:
-        log.info("Running in TEST mode — no changes will be made")
-
+        log.warning("--no-cleanup is retained for compatibility; use --test to prevent all writes")
     summary = RunSummary(test_mode=args.test)
+    summary.cleanup_enabled = True
     session = build_session()
-
-    token_manager = None
-    if not args.input_file:
-        token_manager = TokenManager(session, cfg)
-
     uncreated = []
-
     exit_code = 0
     try:
+        # 1. Pull source-of-truth IOCs from Defender (or offline input).
         if args.input_file:
-            log.info("=" * 60)
-            log.info("OFFLINE MODE: loading indicators from file")
-            log.info("Source file: %s", args.input_file)
-            log.info("=" * 60)
             summary.source = "file"
             summary.source_path = args.input_file
             indicators, raw_pages = load_indicators_from_file(args.input_file)
         else:
-            log.info("Loading indicators from Defender XDR API")
-            indicators, raw_pages = get_all_indicators(
-                session, token_manager, cfg)
-
+            indicators, raw_pages = get_all_indicators(session, TokenManager(session, cfg), cfg)
         paths = build_output_paths(cfg)
         export_raw_json(raw_pages, paths["raw"])
         export_txt(indicators, paths["txt"])
         export_csv(indicators, paths["csv"])
         log_summary(indicators, summary)
-
-        supported_indicators = filter_supported_indicators(
-            indicators, cfg["checkpoint"], summary,
-            uncreated_collection=uncreated,
-        )
+        supported = filter_supported_indicators(indicators, cfg["checkpoint"], summary, uncreated)
+        # Shadowing is determined from the origin set only. Current-feed entries
+        # must not influence desired state because they may be removed by this run.
+        supported = detect_shadowed_domains(supported, None, cfg["checkpoint"], summary, uncreated)
+        desired, raw_by_pair = build_desired_checkpoint_records(supported, cfg["checkpoint"], summary)
 
         if args.skip_checkpoint:
-            log.info("--skip-checkpoint specified; skipping CP operations")
-        elif not cfg["checkpoint"].get("enabled"):
-            log.info("Check Point disabled in config; skipping CP operations")
+            log.info("--skip-checkpoint specified; source export complete")
+        elif not cfg["checkpoint"].get("enabled", True):
+            log.info("Check Point disabled in config; source export complete")
         else:
-            cp_client = CheckPointIOCClient(session, cfg)
-
-            summary.cp_feed_name = cfg["checkpoint"]["feed_name"]
-            log.info("Looking up CP feed '%s'", summary.cp_feed_name)
-            feed_id = cp_client.find_feed_id(summary.cp_feed_name)
-            if not feed_id:
-                raise RuntimeError(
-                    f"Check Point feed '{summary.cp_feed_name}' not found."
-                )
-            summary.cp_feed_id = feed_id
-            log.info("Resolved feed id=%s", feed_id)
-
-            state, state_path = load_state(cfg)
-            feed_state = get_feed_state(state, feed_id)
-            log.info("Local state loaded: %s "
-                     "(tracked indicators for this feed: %d)",
-                     state_path, len(feed_state["indicators"]))
-
-            supported_indicators = detect_shadowed_domains(
-                supported_indicators, feed_state, cfg["checkpoint"],
-                summary, uncreated_collection=uncreated,
-            )
-
-            inject_into_checkpoint(
-                session, cfg, supported_indicators, summary,
-                test_mode=args.test, cp_client=cp_client,
-                state=state, state_path=state_path,
-                uncreated_collection=uncreated,
-            )
-
-            cleanup_stale_from_checkpoint(
-                cfg, supported_indicators, summary,
-                test_mode=args.test, cp_client=cp_client,
-                state=state, state_path=state_path
-            )
-
+            cp_client=CheckPointIOCClient(session,cfg); summary.cp_feed_name=cfg["checkpoint"]["feed_name"]
+            feed_id=cp_client.find_feed_id(summary.cp_feed_name)
+            if not feed_id: raise RuntimeError(f"Check Point feed {summary.cp_feed_name!r} not found")
+            summary.cp_feed_id=feed_id
+            snapshot_current, snapshot_meta = pull_current_checkpoint_feed(session, cfg)
+            inventory, inventory_path = load_managed_inventory(cfg, feed_id)
+            api_total = int((getattr(cp_client, "matched_feed", {}) or {}).get("total_indicators") or 0)
+            if api_total == 0 and snapshot_current:
+                log.warning("Ignoring %d public-feed row(s): management API reports the target feed is empty; the public URL is stale or points to a different feed", len(snapshot_current))
+                snapshot_current = []
+            current=merge_snapshot_and_inventory(snapshot_current,inventory)
+            snapshot_meta.update({"api_total_indicators":api_total,"visible_rows":len(snapshot_current),"managed_inventory_rows":len(inventory),"merged_rows":len(current)})
+            log.info("Reconciliation inventory: api_total=%d visible=%d managed=%d merged=%d",api_total,len(snapshot_current),len(inventory),len(current))
+            plan = plan_checkpoint_changes(desired, current, cfg["checkpoint"], inventory)
+            summary.cp_state_count = plan["counts"]["current"]
+            summary.cp_stale_identified = plan["counts"]["delete"]
+            plan_path = write_change_plan(plan, snapshot_meta, summary, cfg)
+            log.info("Plan: create=%d update=%d delete=%d unchanged=%d", *(
+                plan["counts"][k] for k in ("create", "update", "delete", "unchanged")))
+            safety_problems = validate_change_plan(plan, cfg)
+            if safety_problems:
+                raise RuntimeError("Unsafe change plan blocked: " + "; ".join(safety_problems))
+            if args.test:
+                log.info("TEST mode: plan generated at %s; no Check Point changes applied", plan_path)
+            else:
+                apply_change_plan(cp_client,feed_id,plan,cfg,summary,uncreated,raw_by_pair,inventory,inventory_path)
+                log.info("Applied plan successfully")
     except requests.exceptions.HTTPError:
-        log.error("Aborting due to HTTP error")
+        log.exception("Aborting due to HTTP error")
         exit_code = 1
     except requests.exceptions.RequestException:
-        log.error("Aborting due to network error")
+        log.exception("Aborting due to network error")
         exit_code = 1
     except Exception as e:
-        log.exception("Unexpected fatal error: %s", type(e).__name__)
+        log.exception("Fatal error: %s", e)
         exit_code = 1
     finally:
         by_reason = {r: 0 for r in _UNCREATED_REASONS}
         for item in uncreated:
-            r = item.get("_uncreated_reason", "unknown")
-            by_reason[r] = by_reason.get(r, 0) + 1
+            reason = item.get("_uncreated_reason", "unknown")
+            by_reason[reason] = by_reason.get(reason, 0) + 1
         summary.uncreated_total = len(uncreated)
         summary.uncreated_by_reason = by_reason
-
         try:
-            uncreated_path = write_uncreated_report(uncreated, summary, cfg)
-            summary.uncreated_report_path = uncreated_path
+            summary.uncreated_report_path = write_uncreated_report(uncreated, summary, cfg)
         except Exception as e:
             log.error("Failed to write uncreated report: %s", e)
-
         summary.finalize()
         summary.log_report()
         try:
             write_summary_report(summary, cfg)
         except Exception as e:
             log.error("Failed to write summary report: %s", e)
-
     return exit_code
-
 
 if __name__ == "__main__":
     sys.exit(main())
