@@ -18,6 +18,9 @@ api:
 
 checkpoint:
   enabled: true
+  current_list_url: "https://custom-ioc-enforcement.iaas.checkpoint.com/public/blend/xxxxxxxx.csv"
+  current_list_timeout_seconds: 60
+
   # Configured for the Canadian Portal - update if using a different geo
   auth_url: "https://cloudinfra-gw.ca.portal.checkpoint.com"
   api_base_url: "https://cloudinfra-gw.ca.portal.checkpoint.com/app/ioc-management"
@@ -73,6 +76,7 @@ output:
   summary_prefix: "run_summary"
   uncreated_prefix: "uncreated_indicators"
   state_file: "cp_ioc_state.json"
+  cp_current_list_prefix: "cp_current_list"
 
 logging:
   level: "INFO"
