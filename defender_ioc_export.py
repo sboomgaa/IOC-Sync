@@ -855,9 +855,11 @@ def is_valid_ipv4(value: str) -> bool:
         return False
     if not isinstance(ip, ipaddress.IPv4Address):
         return False
-    if ip.is_private or ip.is_loopback or ip.is_multicast \
-       or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+    if ip.is_loopback:
         return False
+    #if ip.is_private or ip.is_loopback or ip.is_multicast \
+    #   or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+    #    return False
     return True
 
 
